@@ -34,16 +34,25 @@ function required(name, value) {
 required("API_SECRET", API_SECRET);
 const isDryRun = DRY_RUN.toLowerCase() === "true";
 const isRconConfigured = !!(RCON_HOST && RCON_PORT && RCON_PASSWORD);
+const hasDiscordWebhook = !!DISCORD_WEBHOOK_URL;
 
 if (!isRconConfigured) {
   console.warn(
     "RCON is not fully configured (RCON_HOST/RCON_PORT/RCON_PASSWORD missing). VIP grants will fail until fixed."
   );
 }
+if (!hasDiscordWebhook) {
+  console.warn(
+    "Discord webhook is not configured (DISCORD_WEBHOOK_URL missing). Notifications will be skipped."
+  );
+}
 
 // Map products you send from Tranzila notify
 const PRODUCT_MAP = {
   vip_30:      { action: "vip",     duration: "30d", priceLabel: "$19.90" },
+  "vip-monthly": { action: "vip",     duration: "30d", priceLabel: "$19.90" },
+  vip_monthly: { action: "vip",     duration: "30d", priceLabel: "$19.90" },
+  vipmonthly:  { action: "vip",     duration: "30d", priceLabel: "$19.90" },
   rainbow_30:  { action: "rainbow", duration: "30d", priceLabel: "$9.90" },
   coffee:      { action: "coffee",  duration: "perm", priceLabel: "$5.00" }
 };
@@ -110,39 +119,122 @@ function pickFirst(obj, keys) {
   return "";
 }
 
+function pickFirstFromSources(sources, keys) {
+  for (const source of sources) {
+    const value = pickFirst(source, keys);
+    if (value) return value;
+  }
+  return "";
+}
+
+function truncateLog(value, maxLength = 80) {
+  const text = String(value || "");
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}...`;
+}
+
+function normalizeNotifyFields(req) {
+  const sources = [req.body || {}, req.query || {}];
+  const steamid64 = pickFirstFromSources(sources, [
+    "steamid64",
+    "steam_id",
+    "steamid",
+    "userid",
+    "contact",
+    "customer_id"
+  ]);
+  const product = pickFirstFromSources(sources, [
+    "product",
+    "product_id",
+    "item",
+    "plan",
+    "description",
+    "product_description"
+  ]);
+  const status = pickFirstFromSources(sources, [
+    "status",
+    "payment_status",
+    "result",
+    "resp",
+    "response",
+    "response_code"
+  ]);
+  const txnId = pickFirstFromSources(sources, [
+    "txn_id",
+    "transaction_id",
+    "order_id",
+    "index",
+    "confirmation_code"
+  ]);
+  const amount = pickFirstFromSources(sources, ["amount", "sum", "price", "total"]);
+  const responseCode = pickFirstFromSources(sources, [
+    "response_code",
+    "resp_code",
+    "responseCode"
+  ]);
+
+  return {
+    steamid64,
+    product,
+    status,
+    txnId,
+    amount,
+    responseCode
+  };
+}
+
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 
 app.post("/tranzila/notify", async (req, res) => {
   console.log("=== TRANZILA NOTIFY HIT ===");
-  console.log("Headers:", req.headers["content-type"]);
-  console.log("Query:", req.query);
-  console.log("Body:", req.body);
+  console.log("Content-Type:", req.headers["content-type"] || "(none)");
+  console.log("Query keys:", Object.keys(req.query || {}));
+  console.log("Body keys:", Object.keys(req.body || {}));
   try {
     const body = req.body || {};
 
     // Security: shared secret
     const secret =
+      pickFirst(req.headers, ["x-api-key"]) ||
       pickFirst(body, ["secret", "api_secret", "token"]) ||
       pickFirst(req.query, ["secret", "api_secret", "token"]);
     if (secret !== API_SECRET) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
-    if (!isRconConfigured) {
-      return res.status(503).json({ ok: false, error: "rcon_not_configured" });
-    }
+    const normalized = normalizeNotifyFields(req);
+    const {
+      steamid64,
+      product,
+      status,
+      txnId,
+      amount,
+      responseCode
+    } = normalized;
 
-    const steamid64 = pickFirst(body, ["steamid64", "steam_id", "steamid", "userid"]);
-    const status = pickFirst(body, ["status", "payment_status", "result"]);
-    const product = pickFirst(body, ["product", "product_id", "item", "plan"]);
-    const txnId = pickFirst(body, ["txn_id", "transaction_id", "order_id", "index"]);
+    console.log(
+      "Notify summary:",
+      `steamid64=${truncateLog(steamid64) || "(empty)"}`,
+      `product=${truncateLog(product) || "(empty)"}`,
+      `status=${truncateLog(status) || "(empty)"}`,
+      `txn_id=${truncateLog(txnId) || "(empty)"}`
+    );
+    console.log("Notify normalized:", {
+      steamid64: truncateLog(steamid64),
+      product: truncateLog(product),
+      status: truncateLog(status),
+      txnId: truncateLog(txnId),
+      amount: truncateLog(amount)
+    });
 
     if (!steamid64) return res.status(400).json({ ok: false, error: "missing steamid64" });
 
     // flexible success detection
     const s = (status || "").toLowerCase();
-    const isSuccess = ["success", "approved", "ok", "true", "0"].includes(s);
+    const isSuccess =
+      ["success", "approved", "ok", "true"].includes(s) ||
+      ["000", "0"].includes(String(responseCode || "").toLowerCase());
 
     if (!isSuccess) {
       await discordNotify(
@@ -178,9 +270,19 @@ app.post("/tranzila/notify", async (req, res) => {
     let rconResult = null;
     if (rconCommand) {
       if (!isRconConfigured) {
-        return res.status(503).json({ ok: false, error: "rcon_not_configured" });
+        await discordNotify(
+          `⚠️ Payment received but RCON is not configured\nSteamID: ${steamid64}\nProduct: ${humanProduct}\nTxn: ${txnId || "(none)"}\nAction: NOT GRANTED`
+        );
+        return res.status(200).json({ ok: true, granted: false, error: "rcon_not_configured" });
       }
-      rconResult = await rconSend(rconCommand);
+      try {
+        rconResult = await rconSend(rconCommand);
+      } catch (err) {
+        await discordNotify(
+          `❌ RCON failed\nSteamID: ${steamid64}\nProduct: ${humanProduct}\nTxn: ${txnId || "(none)"}\nError: ${err?.message || "unknown"}`
+        );
+        return res.status(502).json({ ok: false, error: "rcon_failed" });
+      }
     }
 
     let msg =
@@ -195,7 +297,12 @@ app.post("/tranzila/notify", async (req, res) => {
 
     await discordNotify(msg);
 
-    return res.status(200).json({ ok: true, granted: !!rconCommand, product, rcon: !!rconResult });
+    return res.status(200).json({
+      ok: true,
+      granted: !!rconCommand,
+      product,
+      rcon: !!rconResult
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok: false, error: "server_error" });
