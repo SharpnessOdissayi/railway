@@ -181,6 +181,47 @@ app.post("/tranzila/notify", async (req, res) => {
   }
 });
 
+app.post("/tranzila/result", async (req, res) => {
+  try {
+    const body = req.body || {};
+
+    const secret = pickFirst(body, ["secret", "api_secret", "token"]);
+    if (secret !== API_SECRET) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const steamid64 = pickFirst(body, ["steamid64", "steam_id", "steamid", "userid"]);
+    const product = pickFirst(body, ["product", "product_id", "item", "plan"]);
+
+    if (!/^\d{17}$/.test(steamid64)) {
+      return res.status(400).json({ ok: false, error: "invalid_steamid64" });
+    }
+
+    const productDaysMap = {
+      vip_7: 7,
+      vip_14: 14,
+      vip_30: 30
+    };
+
+    const days = productDaysMap[product];
+    if (!days) {
+      return res.status(400).json({ ok: false, error: "invalid_product" });
+    }
+
+    try {
+      await rconSend(`loverustvip.grant ${steamid64} ${days}`);
+    } catch (err) {
+      console.error("RCON failed:", err);
+      return res.status(502).json({ ok: false, error: "rcon_failed" });
+    }
+
+    return res.status(200).json({ ok: true, granted: true, product, steamid64, days });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 app.listen(Number(PORT), () => {
   console.log(`LoveRustPayBridge listening on :${PORT}`);
 });
