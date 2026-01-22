@@ -8,6 +8,14 @@ console.log("BOOT: LoveRustPayBridge v2026-01-22-RCON-OPTIONAL");
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
+app.use((err, req, _res, next) => {
+  if (err?.type === "entity.parse.failed") {
+    console.warn("Body parse failed; continuing with empty body.");
+    req.body = {};
+    return next();
+  }
+  return next(err);
+});
 
 const {
   PORT = 8080,
@@ -98,15 +106,19 @@ async function rconSend(command) {
 async function discordNotify(content) {
   if (!DISCORD_WEBHOOK_URL) return;
 
-  const res = await fetch(DISCORD_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content })
-  });
+  try {
+    const res = await fetch(DISCORD_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content })
+    });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    console.warn("Discord webhook failed:", res.status, text);
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.warn("Discord webhook failed:", res.status, text);
+    }
+  } catch (err) {
+    console.warn("Discord webhook error:", err?.message || err);
   }
 }
 
@@ -193,16 +205,6 @@ app.post("/tranzila/notify", async (req, res) => {
   console.log("Body keys:", Object.keys(req.body || {}));
   try {
     const body = req.body || {};
-
-    // Security: shared secret
-    const secret =
-      pickFirst(req.headers, ["x-api-key"]) ||
-      pickFirst(body, ["secret", "api_secret", "token"]) ||
-      pickFirst(req.query, ["secret", "api_secret", "token"]);
-    if (secret !== API_SECRET) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-
     const normalized = normalizeNotifyFields(req);
     const {
       steamid64,
@@ -225,8 +227,18 @@ app.post("/tranzila/notify", async (req, res) => {
       product: truncateLog(product),
       status: truncateLog(status),
       txnId: truncateLog(txnId),
-      amount: truncateLog(amount)
+      amount: truncateLog(amount),
+      responseCode: truncateLog(responseCode)
     });
+
+    // Security: shared secret
+    const secret =
+      pickFirst(req.headers, ["x-api-key"]) ||
+      pickFirst(body, ["secret", "api_secret", "token"]) ||
+      pickFirst(req.query, ["secret", "api_secret", "token"]);
+    if (secret !== API_SECRET) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
 
     if (!steamid64) return res.status(400).json({ ok: false, error: "missing steamid64" });
 
