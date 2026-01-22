@@ -115,7 +115,9 @@ app.post("/tranzila/notify", async (req, res) => {
     const body = req.body || {};
 
     // Security: shared secret
-    const secret = pickFirst(body, ["secret", "api_secret", "token"]);
+    const secret =
+      pickFirst(body, ["secret", "api_secret", "token"]) ||
+      pickFirst(req.query, ["secret", "api_secret", "token"]);
     if (secret !== API_SECRET) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
