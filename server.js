@@ -108,6 +108,9 @@ app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 
 app.post("/tranzila/notify", async (req, res) => {
+  console.log("=== TRANZILA NOTIFY HIT ===");
+  console.log("Headers:", req.headers["content-type"]);
+  console.log("Body:", req.body);
   try {
     const body = req.body || {};
 
