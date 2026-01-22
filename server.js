@@ -8,6 +8,7 @@ console.log("BOOT: LoveRustPayBridge v2026-01-22-RCON-OPTIONAL");
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
+app.use(express.text({ type: ["text/plain"], limit: "1mb" }));
 app.use((err, req, _res, next) => {
   if (err?.type === "entity.parse.failed") {
     console.warn("Body parse failed; continuing with empty body.");
@@ -145,8 +146,26 @@ function truncateLog(value, maxLength = 80) {
   return `${text.slice(0, maxLength)}...`;
 }
 
+function coerceBody(req) {
+  if (typeof req.body === "string") {
+    const trimmed = req.body.trim();
+    if (!trimmed) return {};
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        return JSON.parse(trimmed);
+      } catch (err) {
+        console.warn("Failed to parse JSON body string:", err?.message || err);
+      }
+    }
+    const params = new URLSearchParams(trimmed);
+    return Object.fromEntries(params.entries());
+  }
+  return req.body || {};
+}
+
 function normalizeNotifyFields(req) {
-  const sources = [req.body || {}, req.query || {}];
+  const body = coerceBody(req);
+  const sources = [body, req.query || {}];
   const steamid64 = pickFirstFromSources(sources, [
     "steamid64",
     "steam_id",
@@ -186,6 +205,7 @@ function normalizeNotifyFields(req) {
   ]);
 
   return {
+    body,
     steamid64,
     product,
     status,
@@ -202,11 +222,10 @@ app.post("/tranzila/notify", async (req, res) => {
   console.log("=== TRANZILA NOTIFY HIT ===");
   console.log("Content-Type:", req.headers["content-type"] || "(none)");
   console.log("Query keys:", Object.keys(req.query || {}));
-  console.log("Body keys:", Object.keys(req.body || {}));
   try {
-    const body = req.body || {};
     const normalized = normalizeNotifyFields(req);
     const {
+      body,
       steamid64,
       product,
       status,
@@ -214,6 +233,8 @@ app.post("/tranzila/notify", async (req, res) => {
       amount,
       responseCode
     } = normalized;
+
+    console.log("Body keys:", Object.keys(body || {}));
 
     console.log(
       "Notify summary:",
@@ -323,7 +344,7 @@ app.post("/tranzila/notify", async (req, res) => {
 
 app.post("/tranzila/result", async (req, res) => {
   try {
-    const body = req.body || {};
+    const body = coerceBody(req);
 
     const secret = pickFirst(body, ["secret", "api_secret", "token"]);
     if (secret !== API_SECRET) {
