@@ -5,6 +5,7 @@ import WebSocket from "ws";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false }));
 
 const {
   PORT = 3000,
@@ -29,11 +30,14 @@ function required(name, value) {
 }
 
 required("API_SECRET", API_SECRET);
-required("RCON_HOST", RCON_HOST);
-required("RCON_PORT", RCON_PORT);
-required("RCON_PASSWORD", RCON_PASSWORD);
-
 const isDryRun = DRY_RUN.toLowerCase() === "true";
+const isRconConfigured = Boolean(RCON_HOST && RCON_PORT && RCON_PASSWORD);
+
+if (!isRconConfigured) {
+  console.warn(
+    "RCON is not fully configured (RCON_HOST/RCON_PORT/RCON_PASSWORD missing). VIP grants will fail until fixed."
+  );
+}
 
 // Map products you send from Tranzila notify
 const PRODUCT_MAP = {
@@ -110,6 +114,7 @@ app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 app.post("/tranzila/notify", async (req, res) => {
   console.log("=== TRANZILA NOTIFY HIT ===");
   console.log("Headers:", req.headers["content-type"]);
+  console.log("Query:", req.query);
   console.log("Body:", req.body);
   try {
     const body = req.body || {};
@@ -165,7 +170,12 @@ app.post("/tranzila/notify", async (req, res) => {
     }
 
     let rconResult = null;
-    if (rconCommand) rconResult = await rconSend(rconCommand);
+    if (rconCommand) {
+      if (!isRconConfigured) {
+        return res.status(503).json({ ok: false, error: "rcon_not_configured" });
+      }
+      rconResult = await rconSend(rconCommand);
+    }
 
     let msg =
       `✅ **New Purchase**\n` +
