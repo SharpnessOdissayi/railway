@@ -3,20 +3,22 @@ import express from "express";
 import fetch from "node-fetch";
 import WebSocket from "ws";
 
+console.log("BOOT: LoveRustPayBridge v2026-01-22-RCON-OPTIONAL");
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 
 const {
-  PORT = 3000,
+  PORT = 8080,
 
   // Security
   API_SECRET, // required
 
   // RCON
-  RCON_HOST,      // required
-  RCON_PORT,      // required
-  RCON_PASSWORD,  // required
+  RCON_HOST,
+  RCON_PORT,
+  RCON_PASSWORD,
 
   // Discord
   DISCORD_WEBHOOK_URL, // recommended
@@ -31,7 +33,7 @@ function required(name, value) {
 
 required("API_SECRET", API_SECRET);
 const isDryRun = DRY_RUN.toLowerCase() === "true";
-const isRconConfigured = Boolean(RCON_HOST && RCON_PORT && RCON_PASSWORD);
+const isRconConfigured = !!(RCON_HOST && RCON_PORT && RCON_PASSWORD);
 
 if (!isRconConfigured) {
   console.warn(
@@ -125,6 +127,10 @@ app.post("/tranzila/notify", async (req, res) => {
       pickFirst(req.query, ["secret", "api_secret", "token"]);
     if (secret !== API_SECRET) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    if (!isRconConfigured) {
+      return res.status(503).json({ ok: false, error: "rcon_not_configured" });
     }
 
     const steamid64 = pickFirst(body, ["steamid64", "steam_id", "steamid", "userid"]);
