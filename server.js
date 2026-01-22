@@ -19,8 +19,6 @@ app.use((err, req, _res, next) => {
 });
 
 const {
-  PORT = 8080,
-
   // Security
   API_SECRET, // required
 
@@ -33,8 +31,11 @@ const {
   DISCORD_WEBHOOK_URL, // recommended
 
   // Behavior
-  DRY_RUN = "false"
+  DRY_RUN = "false",
+  PORT
 } = process.env;
+
+const resolvedPort = PORT || 8080;
 
 function required(name, value) {
   if (!value) throw new Error(`Missing required env var: ${name}`);
@@ -383,6 +384,6 @@ app.post("/tranzila/result", async (req, res) => {
   }
 });
 
-app.listen(Number(PORT), () => {
-  console.log(`LoveRustPayBridge listening on :${PORT}`);
+app.listen(resolvedPort, "0.0.0.0", () => {
+  console.log(`LoveRustPayBridge listening on :${resolvedPort}`);
 });
