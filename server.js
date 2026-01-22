@@ -10,7 +10,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 
 const {
-  PORT = 3000,
+  PORT = 8080,
 
   // Security
   API_SECRET, // required
