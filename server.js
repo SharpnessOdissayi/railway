@@ -8,7 +8,6 @@ import { open } from "sqlite";
 import WebSocket from "ws";
 import {
   resolveCanonicalSku,
-  resolveEffectiveSku,
   resolveRconCommands
 } from "./tranzilaProducts.js";
 
@@ -89,16 +88,10 @@ const SKU_MAP = {
     ],
     durationSeconds: 2592000
   },
-  vip_test_10m: {
+  rainbow_10m: {
     type: "permissions",
-    rconGrant: [
-      "oxide.grant user {steamid64} loverustvip.use",
-      "oxide.grant user {steamid64} vipwall.use"
-    ],
-    rconRevoke: [
-      "oxide.revoke user {steamid64} loverustvip.use",
-      "oxide.revoke user {steamid64} vipwall.use"
-    ],
+    rconGrant: ["oxide.grant user {steamid64} loverustvip.rainbow"],
+    rconRevoke: ["oxide.revoke user {steamid64} loverustvip.rainbow"],
     durationSeconds: 600
   },
   rainbow_30d: {
@@ -324,6 +317,7 @@ function normalizeNotifyFields(req) {
     "description"
   ]);
   const product = pickFirstFromSources(sources, ["product", "sku"]);
+  const plan = pickFirstFromSources(sources, ["plan"]);
   const amount = pickFirstFromSources(sources, ["sum", "amount", "total"]);
   const status = pickFirstFromSources(sources, ["status", "Response", "response"]);
   const responseCode = pickFirstFromSources(sources, ["Response", "response"]);
@@ -347,6 +341,7 @@ function normalizeNotifyFields(req) {
     custom2,
     pdesc,
     product,
+    plan,
     amount,
     status,
     responseCode,
@@ -774,6 +769,7 @@ app.post("/tranzila/notify", async (req, res) => {
       custom2,
       pdesc,
       product,
+      plan,
       amount,
       status,
       responseCode,
@@ -781,11 +777,17 @@ app.post("/tranzila/notify", async (req, res) => {
       txnIdSource
     } = normalized;
     const logTxnId = isSensitiveLogKey(txnIdSource) ? "(redacted)" : truncateLog(txnId);
-    const resolvedSku = resolveCanonicalSku({ custom2, pdesc, product });
-    const { effectiveSku, reason: testReason } = resolveEffectiveSku(
-      resolvedSku,
-      process.env.TEST_TARGET
-    );
+    const rawCustom2 = (body?.custom2 ?? custom2 ?? "").toString().trim();
+    const rawPdesc = (body?.pdesc ?? pdesc ?? "").toString().trim();
+    const rawProduct = (body?.product ?? product ?? "").toString().trim();
+    const rawPlan = (body?.plan ?? plan ?? "").toString().trim();
+    const resolvedSku = resolveCanonicalSku({
+      custom2: rawCustom2 || custom2,
+      pdesc: rawPdesc || pdesc,
+      product: rawProduct || product,
+      plan: rawPlan || plan
+    });
+    const effectiveSku = resolvedSku;
 
     console.log("Body keys:", Object.keys(body || {}));
 
@@ -795,6 +797,11 @@ app.post("/tranzila/notify", async (req, res) => {
       `product=${truncateLog(product) || "(empty)"}`,
       `status=${truncateLog(status) || "(empty)"}`,
       `txn_id=${logTxnId || "(empty)"}`
+    );
+    console.log(
+      "Notify SKU sources:",
+      `custom2="${truncateLog(rawCustom2)}"`,
+      `pdesc="${truncateLog(rawPdesc)}"`
     );
     console.log("Notify normalized:", {
       steamid64: truncateLog(steamid64),
@@ -863,10 +870,6 @@ app.post("/tranzila/notify", async (req, res) => {
 
     if (!resolvedSku) {
       return res.status(200).json({ ok: false, reason: "unknown_product" });
-    }
-
-    if (testReason) {
-      return res.status(200).json({ ok: false, reason: testReason });
     }
 
     const { commands } = resolveRconCommands({
