@@ -66,28 +66,41 @@ const DATABASE_PATH = DB_PATH || "./data.sqlite";
 
 const SKU_MAP = {
   vip_30d: {
-    type: "group",
-    rconGrant: "oxide.usergroup add {steamid64} vip",
-    rconRevoke: "oxide.usergroup remove {steamid64} vip",
+    type: "permissions",
+    rconGrant: [
+      "oxide.grant user {steamid64} loverustvip.use",
+      "oxide.grant user {steamid64} vipwall.use"
+    ],
+    rconRevoke: [
+      "oxide.revoke user {steamid64} loverustvip.use",
+      "oxide.revoke user {steamid64} vipwall.use"
+    ],
     durationSeconds: 2592000
   },
   vip_test_10m: {
-    type: "group",
-    rconGrant: "oxide.usergroup add {steamid64} vip",
-    rconRevoke: "oxide.usergroup remove {steamid64} vip",
+    type: "permissions",
+    rconGrant: [
+      "oxide.grant user {steamid64} loverustvip.use",
+      "oxide.grant user {steamid64} vipwall.use"
+    ],
+    rconRevoke: [
+      "oxide.revoke user {steamid64} loverustvip.use",
+      "oxide.revoke user {steamid64} vipwall.use"
+    ],
     durationSeconds: 600
   },
   rainbow_30d: {
-    type: "permission",
-    rconGrant: "oxide.grant user {steamid64} vip.rainbow",
-    rconRevoke: "oxide.revoke user {steamid64} vip.rainbow",
+    type: "permissions",
+    rconGrant: ["oxide.grant user {steamid64} loverustvip.rainbow"],
+    rconRevoke: ["oxide.revoke user {steamid64} loverustvip.rainbow"],
     durationSeconds: 2592000
   },
   coffee_support: {
-    type: "group",
-    rconGrant: "oxide.usergroup add {steamid64} supporter",
-    rconRevoke: "oxide.usergroup remove {steamid64} supporter",
-    durationSeconds: 0
+    type: "no_grant",
+    rconGrant: [],
+    rconRevoke: [],
+    durationSeconds: 0,
+    skipGrant: true
   }
 };
 
@@ -355,9 +368,30 @@ app.post("/tranzila/notify", async (req, res) => {
       return res.status(200).json({ ok: true, unknown_product: true });
     }
 
-    const rconCommand = mapped.rconGrant.replace("{steamid64}", steamid64);
-    const revokeCommand = mapped.rconRevoke.replace("{steamid64}", steamid64);
-    const humanProduct = `${sku} (${mapped.type})`;
+    const rconGrantCommands = (mapped.rconGrant || []).map((command) =>
+      command.replace("{steamid64}", steamid64)
+    );
+    const rconRevokeCommands = (mapped.rconRevoke || []).map((command) =>
+      command.replace("{steamid64}", steamid64)
+    );
+
+    if (mapped.skipGrant) {
+      await db.run(
+        "INSERT INTO transactions (txnId, steamid64, sku, status, amount, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        txnId,
+        steamid64,
+        sku,
+        "no_grant",
+        amount || null,
+        new Date().toISOString()
+      );
+
+      await discordNotify(
+        `ℹ️ Payment received (no grant)\nSteamID: ${steamid64}\nSKU: ${sku}\nTxn: ${txnId}\nResult: NO_GRANT`
+      );
+
+      return res.status(200).json({ ok: true, granted: false, sku, no_grant: true });
+    }
 
     let rconResult = null;
     if (!isRconConfigured) {
@@ -367,8 +401,10 @@ app.post("/tranzila/notify", async (req, res) => {
       return res.status(200).json({ ok: true, granted: false, error: "rcon_not_configured" });
     }
     try {
-      console.log(`RCON grant command: ${rconCommand}`);
-      rconResult = await rconSend(rconCommand);
+      for (const command of rconGrantCommands) {
+        console.log(`RCON grant command: ${command}`);
+        rconResult = await rconSend(command);
+      }
     } catch (err) {
       await discordNotify(
         `❌ RCON failed\nSteamID: ${steamid64}\nSKU: ${sku}\nTxn: ${txnId}\nError: ${err?.message || "unknown"}`
@@ -386,28 +422,31 @@ app.post("/tranzila/notify", async (req, res) => {
       new Date().toISOString()
     );
 
-    if (mapped.durationSeconds > 0) {
+    if (mapped.durationSeconds > 0 && rconRevokeCommands.length > 0) {
       const grantedAt = new Date();
       const expiresAt = new Date(grantedAt.getTime() + mapped.durationSeconds * 1000);
-      await db.run(
-        `INSERT INTO entitlements (steamid64, sku, txnId, grantedAt, expiresAt, revokeCommand)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        steamid64,
-        sku,
-        txnId,
-        grantedAt.toISOString(),
-        expiresAt.toISOString(),
-        revokeCommand
-      );
+      for (const revokeCommand of rconRevokeCommands) {
+        await db.run(
+          `INSERT INTO entitlements (steamid64, sku, txnId, grantedAt, expiresAt, revokeCommand)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          steamid64,
+          sku,
+          txnId,
+          grantedAt.toISOString(),
+          expiresAt.toISOString(),
+          revokeCommand
+        );
+      }
     }
 
     let msg =
-      `✅ **New Purchase**\n` +
+      `✅ **Purchase Fulfilled**\n` +
       `**Player (SteamID64):** ${steamid64}\n` +
       `**SKU:** ${sku}\n` +
       (txnId ? `**Txn:** ${txnId}\n` : "") +
       (amount ? `**Amount:** ${amount}\n` : "") +
-      (rconCommand ? `**RCON:** \`${rconCommand}\`` : `**RCON:** (none)`);
+      `**Result:** GRANTED\n` +
+      `**RCON:** ${rconGrantCommands.length ? rconGrantCommands.map((command) => `\`${command}\``).join(", ") : "(none)"}`;
 
     await discordNotify(msg);
 
@@ -433,31 +472,34 @@ app.post("/tranzila/result", async (req, res) => {
     }
 
     const steamid64 = pickFirst(body, ["steamid64", "steam_id", "steamid", "userid"]);
-    const product = pickFirst(body, ["product", "product_id", "item", "plan"]);
+    const sku = pickFirst(body, ["sku"]);
 
     if (!/^\d{17}$/.test(steamid64)) {
       return res.status(400).json({ ok: false, error: "invalid_steamid64" });
     }
 
-    const productDaysMap = {
-      vip_7: 7,
-      vip_14: 14,
-      vip_30: 30
-    };
+    if (!sku) {
+      return res.status(400).json({ ok: false, error: "missing_sku" });
+    }
 
-    const days = productDaysMap[product];
-    if (!days) {
-      return res.status(400).json({ ok: false, error: "invalid_product" });
+    const mapped = SKU_MAP[sku];
+    if (!mapped || mapped.skipGrant) {
+      return res.status(400).json({ ok: false, error: "invalid_sku" });
     }
 
     try {
-      await rconSend(`loverustvip.grant ${steamid64} ${days}`);
+      const rconGrantCommands = (mapped.rconGrant || []).map((command) =>
+        command.replace("{steamid64}", steamid64)
+      );
+      for (const command of rconGrantCommands) {
+        await rconSend(command);
+      }
     } catch (err) {
       console.error("RCON failed:", err);
       return res.status(502).json({ ok: false, error: "rcon_failed" });
     }
 
-    return res.status(200).json({ ok: true, granted: true, product, steamid64, days });
+    return res.status(200).json({ ok: true, granted: true, sku, steamid64 });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok: false, error: "server_error" });
