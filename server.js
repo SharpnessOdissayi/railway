@@ -376,9 +376,162 @@ async function persistProcessedTxIds(txIds) {
 }
 
 const processedTxIdsPromise = loadProcessedTxIds();
+const STATUS_CACHE_TTL_MS = 10 * 1000;
+const STATUS_RAW_MAX = 600;
+const statusCache = {
+  value: null,
+  expiresAt: 0,
+  inflight: null
+};
+
+function readStatusCache() {
+  if (!statusCache.value) return null;
+  if (Date.now() >= statusCache.expiresAt) return null;
+  return statusCache.value;
+}
+
+function writeStatusCache(payload) {
+  statusCache.value = payload;
+  statusCache.expiresAt = Date.now() + STATUS_CACHE_TTL_MS;
+}
+
+function truncateRawStatus(raw) {
+  if (!raw) return "";
+  const text = String(raw).trim();
+  if (text.length <= STATUS_RAW_MAX) return text;
+  return `${text.slice(0, STATUS_RAW_MAX)}...`;
+}
+
+function formatStatusPayload({ ok, online, max, raw, error }) {
+  const payload = {
+    ok: Boolean(ok),
+    online: Number.isFinite(online) ? online : null,
+    max: Number.isFinite(max) ? max : null,
+    updatedAt: new Date().toISOString()
+  };
+  if (raw) payload.raw = truncateRawStatus(raw);
+  if (error) payload.error = error;
+  return payload;
+}
+
+function parsePlayerCounts(raw) {
+  if (!raw) return { online: null, max: null };
+  const text = String(raw);
+  const patterns = [
+    /players?\s*[:=]?\s*(\d+)\s*(?:\/|\(|\s+of\s+)\s*(\d+)/i,
+    /players?\s*[:=]?\s*(\d+)\s*\(\s*(\d+)\s*max\s*\)/i,
+    /(\d+)\s*players?\s*[,/]\s*(\d+)\s*max/i,
+    /players?\s*[:=]?\s*(\d+)\s*\/\s*(\d+)/i,
+    /(\d+)\s*\/\s*(\d+)\s*players?/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const online = Number.parseInt(match[1], 10);
+      const max = Number.parseInt(match[2], 10);
+      if (Number.isFinite(online) && Number.isFinite(max)) {
+        return { online, max };
+      }
+    }
+  }
+
+  if (/players?|max/i.test(text)) {
+    const numberMatches = [...text.matchAll(/\d+/g)].map((match) => Number.parseInt(match[0], 10));
+    if (numberMatches.length >= 2) {
+      return { online: numberMatches[0], max: numberMatches[1] };
+    }
+  }
+  return { online: null, max: null };
+}
+
+async function fetchServerStatus() {
+  if (!isRconConfigured) {
+    const payload = formatStatusPayload({
+      ok: false,
+      online: null,
+      max: null,
+      error: "rcon_not_configured"
+    });
+    writeStatusCache(payload);
+    return payload;
+  }
+
+  try {
+    const result = await rconSend("status", { timeoutMs: 3000 });
+    const raw = result?.raw || "";
+    const { online, max } = parsePlayerCounts(raw);
+    if (Number.isFinite(online) && Number.isFinite(max)) {
+      const payload = formatStatusPayload({ ok: true, online, max, raw });
+      writeStatusCache(payload);
+      return payload;
+    }
+    const payload = formatStatusPayload({
+      ok: false,
+      online: null,
+      max: null,
+      raw,
+      error: "parse_failed"
+    });
+    writeStatusCache(payload);
+    return payload;
+  } catch (err) {
+    const payload = formatStatusPayload({
+      ok: false,
+      online: null,
+      max: null,
+      error: "rcon_unreachable"
+    });
+    writeStatusCache(payload);
+    return payload;
+  }
+}
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+app.options("/server/status", (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  return res.status(204).send();
+});
+app.get("/server/status", async (req, res) => {
+  const origin = req.headers.origin;
+  const allowedOrigin = origin === "https://loverust.gg" ? origin : "*";
+  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Vary", "Origin");
+
+  try {
+    const cached = readStatusCache();
+    if (cached) {
+      return res.status(200).json(cached);
+    }
+
+    const pending = statusCache.inflight;
+    if (pending) {
+      const result = await pending;
+      return res.status(200).json(result);
+    }
+
+    const work = fetchServerStatus().finally(() => {
+      statusCache.inflight = null;
+    });
+    statusCache.inflight = work;
+    const result = await work;
+    return res.status(200).json(result);
+  } catch (err) {
+    console.warn("Status endpoint error:", err?.message || err);
+    const payload = formatStatusPayload({
+      ok: false,
+      online: null,
+      max: null,
+      error: "server_error"
+    });
+    writeStatusCache(payload);
+    return res.status(200).json(payload);
+  }
+});
 app.get("/debug/test-discord", async (req, res) => {
   const token = pickFirst(req.query, ["token"]);
   if (!TRAZNILA_NOTIFY_SECRET || token !== TRAZNILA_NOTIFY_SECRET) {
