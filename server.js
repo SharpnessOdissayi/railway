@@ -1,6 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
+import fs from "node:fs/promises";
+import path from "node:path";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import WebSocket from "ws";
@@ -37,6 +39,7 @@ const {
 
   // Behavior
   DRY_RUN = "false",
+  TRAZNILA_NOTIFY_SECRET,
   PORT
 } = process.env;
 
@@ -63,6 +66,7 @@ if (!hasDiscordWebhook) {
 }
 
 const DATABASE_PATH = DB_PATH || "./data.sqlite";
+const PROCESSED_TX_PATH = path.resolve("./data/processed.json");
 
 const SKU_MAP = {
   vip_30d: {
@@ -105,7 +109,7 @@ const SKU_MAP = {
 };
 
 // Rust RCON uses WebSocket: ws://HOST:PORT/PASSWORD
-async function rconSend(command) {
+async function rconSend(command, { timeoutMs = 8000 } = {}) {
   if (isDryRun) {
     console.log(`[DRY_RUN] RCON command: ${command}`);
     return { ok: true, dryRun: true };
@@ -119,7 +123,7 @@ async function rconSend(command) {
     const timeout = setTimeout(() => {
       try { ws.close(); } catch {}
       reject(new Error("RCON timeout"));
-    }, 8000);
+    }, timeoutMs);
 
     ws.on("open", () => {
       ws.send(JSON.stringify({
@@ -248,35 +252,92 @@ function normalizeNotifyFields(req) {
   const sources = [body, req.query || {}];
   const steamid64 = pickFirstFromSources(sources, [
     "steamid64",
-    "steam_id",
-    "steamid",
-    "userid",
     "contact",
-    "customer_id"
+    "steam_id",
+    "steamId",
+    "custom1"
   ]);
-  const status = pickFirstFromSources(sources, [
-    "status",
-    "payment_status",
-    "result",
-    "resp",
-    "response",
-    "response_code"
+  const product = pickFirstFromSources(sources, [
+    "product",
+    "sku",
+    "pdesc",
+    "plan",
+    "description"
   ]);
-  const txnId = pickFirstFromSources(sources, ["txnId", "orderid", "requestId"]);
-  const amount = pickFirstFromSources(sources, ["amount", "sum", "price", "total"]);
-  const responseCode = pickFirstFromSources(sources, ["responseCode", "response_code", "resp_code"]);
-  const sku = pickFirstFromSources(sources, ["sku"]);
+  const amount = pickFirstFromSources(sources, ["sum", "amount", "total"]);
+  const status = pickFirstFromSources(sources, ["status", "Response", "response"]);
+  const responseCode = pickFirstFromSources(sources, ["Response", "response"]);
+  const txnId = pickFirstFromSources(sources, [
+    "tx",
+    "txnId",
+    "transaction_id",
+    "tranId",
+    "transId",
+    "ConfirmationCode",
+    "index",
+    "orderid",
+    "orderId",
+    "id",
+    "Tempref"
+  ]);
 
   return {
     body,
     steamid64,
-    sku,
-    status,
-    txnId,
+    product,
     amount,
-    responseCode
+    status,
+    responseCode,
+    txnId
   };
 }
+
+function normalizeProduct(product) {
+  if (!product) return "";
+  return String(product).trim().toLowerCase().replace(/-/g, "_");
+}
+
+function isApprovedStatus(status, responseCode) {
+  const values = [status, responseCode].filter(Boolean).map((value) => String(value).trim().toLowerCase());
+  if (!values.length) return false;
+  return values.some((value) => {
+    if (["approved", "ok", "success"].includes(value)) return true;
+    return /^0+$/.test(value);
+  });
+}
+
+const RCON_PRODUCT_MAP = {
+  test_vip: ["loverustvip.grant {steamid64} 10m"],
+  vip_30: ["loverustvip.grant {steamid64} 30d"],
+  rainbow_30: [
+    "loverustvip.grant {steamid64} 30d",
+    "oxide.grant user {steamid64} vip.rainbow"
+  ]
+};
+
+async function loadProcessedTxIds() {
+  try {
+    const content = await fs.readFile(PROCESSED_TX_PATH, "utf8");
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) {
+      return new Set(parsed.map((value) => String(value)));
+    }
+    return new Set();
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.warn("Failed to read processed tx file:", err?.message || err);
+    }
+    return new Set();
+  }
+}
+
+async function persistProcessedTxIds(txIds) {
+  await fs.mkdir(path.dirname(PROCESSED_TX_PATH), { recursive: true });
+  const payload = JSON.stringify([...txIds], null, 2);
+  await fs.writeFile(PROCESSED_TX_PATH, payload, "utf8");
+}
+
+const processedTxIdsPromise = loadProcessedTxIds();
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
@@ -290,175 +351,133 @@ app.post("/tranzila/notify", async (req, res) => {
     const {
       body,
       steamid64,
-      sku,
-      status,
-      txnId,
+      product,
       amount,
-      responseCode
+      status,
+      responseCode,
+      txnId
     } = normalized;
+    const normalizedProduct = normalizeProduct(product);
 
     console.log("Body keys:", Object.keys(body || {}));
 
     console.log(
       "Notify summary:",
       `steamid64=${truncateLog(steamid64) || "(empty)"}`,
-      `sku=${truncateLog(sku) || "(empty)"}`,
+      `product=${truncateLog(product) || "(empty)"}`,
       `status=${truncateLog(status) || "(empty)"}`,
       `txn_id=${truncateLog(txnId) || "(empty)"}`
     );
     console.log("Notify normalized:", {
       steamid64: truncateLog(steamid64),
-      sku: truncateLog(sku),
+      product: truncateLog(product),
+      normalizedProduct: truncateLog(normalizedProduct),
       status: truncateLog(status),
       txnId: truncateLog(txnId),
       amount: truncateLog(amount),
       responseCode: truncateLog(responseCode)
     });
 
-    // Security: shared secret
-    const secret =
-      pickFirst(req.headers, ["x-api-key"]) ||
-      pickFirst(body, ["secret", "api_secret", "token"]) ||
-      pickFirst(req.query, ["secret", "api_secret", "token"]);
-    if (secret !== API_SECRET) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
+    // Security: shared secret (optional)
+    if (TRAZNILA_NOTIFY_SECRET) {
+      const authHeader = pickFirst(req.headers, ["authorization"]);
+      const bearerToken = authHeader?.toLowerCase().startsWith("bearer ")
+        ? authHeader.slice(7).trim()
+        : "";
+      const secret =
+        pickFirst(req.headers, ["x-tranzila-secret", "x-notify-token"]) ||
+        bearerToken ||
+        pickFirst(body, ["token", "secret", "api_secret"]) ||
+        pickFirst(req.query, ["token"]);
+      if (!secret || secret !== TRAZNILA_NOTIFY_SECRET) {
+        return res.status(401).json({ ok: false, reason: "unauthorized" });
+      }
     }
 
-    if (!steamid64) return res.status(400).json({ ok: false, error: "missing steamid64" });
+    if (!/^\d{17}$/.test(steamid64)) {
+      return res.status(400).json({ ok: false, reason: "invalid_steamid64" });
+    }
 
-    const statusNormalized = String(status || "").toLowerCase();
-    const isSuccess =
-      statusNormalized === "approved" && String(responseCode || "").toLowerCase() === "000";
+    const isSuccess = isApprovedStatus(status, responseCode);
 
     if (!isSuccess) {
-      await discordNotify(
-        `❌ Payment not successful\nSteamID: ${steamid64}\nStatus: ${status || "(empty)"}\nResponseCode: ${responseCode || "(empty)"}\nSKU: ${sku || "(empty)"}\nTxn: ${txnId || "(none)"}`
-      );
-      return res.status(200).json({ ok: true, ignored: true });
+      console.warn("Notify rejected: not approved", {
+        steamid64,
+        status,
+        responseCode,
+        txnId
+      });
+      return res.status(400).json({ ok: false, reason: "not_approved" });
     }
 
     if (!txnId) {
-      await discordNotify(
-        `❌ Payment missing txnId - not granting\nSteamID: ${steamid64}\nSKU: ${sku || "(empty)"}\nStatus: ${status || "(empty)"}\nResponseCode: ${responseCode || "(empty)"}`
-      );
-      return res.status(400).json({ ok: false, error: "missing_txnId" });
+      console.warn("Notify rejected: missing txId", {
+        steamid64,
+        product,
+        status,
+        responseCode
+      });
+      return res.status(400).json({ ok: false, reason: "missing_txId" });
     }
 
-    const db = await dbPromise;
-    const existingTxn = await db.get("SELECT txnId FROM transactions WHERE txnId = ?", txnId);
-    if (existingTxn) {
+    const processedTxIds = await processedTxIdsPromise;
+    if (processedTxIds.has(txnId)) {
       console.log(`Duplicate txnId ignored: ${txnId}`);
-      return res.status(200).json({ ok: true, duplicate: true, message: "duplicate ignored" });
-    }
-
-    const mapped = SKU_MAP[sku];
-    if (!mapped) {
-      await discordNotify(
-        `⚠️ Payment received but SKU is unknown\nSteamID: ${steamid64}\nSKU: ${sku || "(empty)"}\nTxn: ${txnId || "(none)"}\nAction: NOT GRANTED`
-      );
-      await db.run(
-        "INSERT INTO transactions (txnId, steamid64, sku, status, amount, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
-        txnId,
+      return res.status(200).json({
+        ok: true,
+        txId: txnId,
         steamid64,
-        sku || "unknown",
-        "unknown_sku",
-        amount || null,
-        new Date().toISOString()
-      );
-      return res.status(200).json({ ok: true, unknown_product: true });
+        product: normalizedProduct || product,
+        actions: [],
+        duplicate: true
+      });
     }
 
-    const rconGrantCommands = (mapped.rconGrant || []).map((command) =>
-      command.replace("{steamid64}", steamid64)
-    );
-    const rconRevokeCommands = (mapped.rconRevoke || []).map((command) =>
-      command.replace("{steamid64}", steamid64)
-    );
+    if (!normalizedProduct) {
+      return res.status(400).json({ ok: false, reason: "missing_product" });
+    }
 
-    if (mapped.skipGrant) {
-      await db.run(
-        "INSERT INTO transactions (txnId, steamid64, sku, status, amount, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
-        txnId,
+    const commands = RCON_PRODUCT_MAP[normalizedProduct] || [];
+    if (!commands.length) {
+      console.warn("Notify rejected: unknown product", {
         steamid64,
-        sku,
-        "no_grant",
-        amount || null,
-        new Date().toISOString()
-      );
-
-      await discordNotify(
-        `ℹ️ Payment received (no grant)\nSteamID: ${steamid64}\nSKU: ${sku}\nTxn: ${txnId}\nResult: NO_GRANT`
-      );
-
-      return res.status(200).json({ ok: true, granted: false, sku, no_grant: true });
+        product,
+        normalizedProduct,
+        txnId
+      });
+      return res.status(400).json({ ok: false, reason: "unknown_product" });
     }
 
-    let rconResult = null;
     if (!isRconConfigured) {
-      await discordNotify(
-        `⚠️ Payment received but RCON is not configured\nSteamID: ${steamid64}\nSKU: ${sku}\nTxn: ${txnId}\nAction: NOT GRANTED`
-      );
-      return res.status(200).json({ ok: true, granted: false, error: "rcon_not_configured" });
+      return res.status(502).json({ ok: false, reason: "rcon_not_configured" });
     }
     try {
-      for (const command of rconGrantCommands) {
-        console.log(`RCON grant command: ${command}`);
-        rconResult = await rconSend(command);
+      const actions = [];
+      for (const command of commands) {
+        const resolvedCommand = command.replace("{steamid64}", steamid64);
+        console.log(`RCON command: ${resolvedCommand}`);
+        const result = await rconSend(resolvedCommand, { timeoutMs: 4000 });
+        console.log("RCON result:", result);
+        actions.push({ command: resolvedCommand, result });
       }
+
+      processedTxIds.add(txnId);
+      await persistProcessedTxIds(processedTxIds);
+
+      return res.status(200).json({
+        ok: true,
+        txId: txnId,
+        steamid64,
+        product: normalizedProduct,
+        actions
+      });
     } catch (err) {
-      await discordNotify(
-        `❌ RCON failed\nSteamID: ${steamid64}\nSKU: ${sku}\nTxn: ${txnId}\nError: ${err?.message || "unknown"}`
-      );
-      return res.status(502).json({ ok: false, error: "rcon_failed" });
+      console.warn("Notify rejected: rcon_failed", err?.message || err);
+      return res.status(502).json({ ok: false, reason: "rcon_failed" });
     }
-
-    await db.run(
-      "INSERT INTO transactions (txnId, steamid64, sku, status, amount, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
-      txnId,
-      steamid64,
-      sku,
-      "granted",
-      amount || null,
-      new Date().toISOString()
-    );
-
-    if (mapped.durationSeconds > 0 && rconRevokeCommands.length > 0) {
-      const grantedAt = new Date();
-      const expiresAt = new Date(grantedAt.getTime() + mapped.durationSeconds * 1000);
-      for (const revokeCommand of rconRevokeCommands) {
-        await db.run(
-          `INSERT INTO entitlements (steamid64, sku, txnId, grantedAt, expiresAt, revokeCommand)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          steamid64,
-          sku,
-          txnId,
-          grantedAt.toISOString(),
-          expiresAt.toISOString(),
-          revokeCommand
-        );
-      }
-    }
-
-    let msg =
-      `✅ **Purchase Fulfilled**\n` +
-      `**Player (SteamID64):** ${steamid64}\n` +
-      `**SKU:** ${sku}\n` +
-      (txnId ? `**Txn:** ${txnId}\n` : "") +
-      (amount ? `**Amount:** ${amount}\n` : "") +
-      `**Result:** GRANTED\n` +
-      `**RCON:** ${rconGrantCommands.length ? rconGrantCommands.map((command) => `\`${command}\``).join(", ") : "(none)"}`;
-
-    await discordNotify(msg);
-
-    return res.status(200).json({
-      ok: true,
-      granted: true,
-      sku,
-      rcon: !!rconResult
-    });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ ok: false, error: "server_error" });
+    return res.status(500).json({ ok: false, reason: "server_error" });
   }
 });
 
