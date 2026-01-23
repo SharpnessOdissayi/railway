@@ -89,16 +89,18 @@ const SKU_MAP = {
     ],
     durationSeconds: 2592000
   },
-  rainbow_10m: {
-    type: "permissions",
-    rconGrant: ["oxide.grant user {steamid64} loverustvip.rainbow"],
-    rconRevoke: ["oxide.revoke user {steamid64} loverustvip.rainbow"],
-    durationSeconds: 600
-  },
   rainbow_30d: {
     type: "permissions",
-    rconGrant: ["oxide.grant user {steamid64} loverustvip.rainbow"],
-    rconRevoke: ["oxide.revoke user {steamid64} loverustvip.rainbow"],
+    rconGrant: [
+      "oxide.grant user {steamid64} loverustvip.use",
+      "oxide.grant user {steamid64} vipwall.use",
+      "oxide.grant user {steamid64} loverustvip.rainbow"
+    ],
+    rconRevoke: [
+      "oxide.revoke user {steamid64} loverustvip.use",
+      "oxide.revoke user {steamid64} vipwall.use",
+      "oxide.revoke user {steamid64} loverustvip.rainbow"
+    ],
     durationSeconds: 2592000
   },
   coffee_support: {
@@ -189,6 +191,32 @@ const dbPromise = initDb().catch((err) => {
   console.error("Failed to initialize database:", err);
   process.exit(1);
 });
+
+async function recordEntitlements({ steamid64, effectiveSku, txnId, grantedAt }) {
+  const mapped = SKU_MAP[effectiveSku];
+  if (!mapped || mapped.skipGrant) return;
+  const revokeCommands = mapped.rconRevoke || [];
+  if (!revokeCommands.length) return;
+
+  const grantedAtIso = grantedAt.toISOString();
+  const expiresAt = mapped.durationSeconds
+    ? new Date(grantedAt.getTime() + mapped.durationSeconds * 1000).toISOString()
+    : null;
+  const db = await dbPromise;
+
+  for (const command of revokeCommands) {
+    const revokeCommand = command.replace("{steamid64}", steamid64);
+    await db.run(
+      "INSERT INTO entitlements (steamid64, sku, txnId, grantedAt, expiresAt, revokeCommand) VALUES (?, ?, ?, ?, ?, ?)",
+      steamid64,
+      effectiveSku,
+      txnId,
+      grantedAtIso,
+      expiresAt,
+      revokeCommand
+    );
+  }
+}
 
 function resolveDiscordWebhook(env, keys) {
   for (const key of keys) {
@@ -383,6 +411,13 @@ function isApprovedStatus(status, responseCode) {
 
 function isIdempotentSource(_req) {
   return true;
+}
+
+function isDuplicateWindow(txnId, now = Date.now()) {
+  const record = recentTxIds.get(txnId);
+  if (!record) return false;
+  const ageMs = now - record.at;
+  return ageMs < 5 * 60 * 1000;
 }
 
 function delay(ms) {
@@ -912,6 +947,18 @@ app.post("/tranzila/notify", async (req, res) => {
       return res.status(400).json({ ok: false, reason: "missing_txId" });
     }
 
+    if (isDuplicateWindow(txnId)) {
+      console.warn("Duplicate notify ignored: inflight", logTxnId);
+      return res.status(200).json({
+        ok: true,
+        txId: txnId,
+        steamid64,
+        product: resolvedSku || product,
+        actions: [],
+        deduped: true
+      });
+    }
+
     if (hasProcessedTx(txnId)) {
       console.log(`Duplicate txnId ignored: ${logTxnId}`);
       return res.status(200).json({
@@ -1009,6 +1056,14 @@ app.post("/tranzila/notify", async (req, res) => {
         count: commands.length,
         steamid64: truncateLog(steamid64),
         txnId: logTxnId
+      });
+
+      await recordEntitlements({
+        steamid64,
+        effectiveSku,
+        txnId,
+        amount,
+        grantedAt: new Date()
       });
 
       markProcessedTx(txnId);

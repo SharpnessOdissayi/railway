@@ -8,10 +8,14 @@ const SKU_ALIASES = {
 };
 
 const RCON_PRODUCT_MAP = {
-  vip_30d: ["loverustvip.grant {steamid64} 30d"],
+  vip_30d: [
+    "oxide.grant user {steamid64} loverustvip.use",
+    "oxide.grant user {steamid64} vipwall.use"
+  ],
   rainbow_30d: [
-    "loverustvip.grant {steamid64} 30d",
-    "loverustvip.setcolor {steamid64} rainbow"
+    "oxide.grant user {steamid64} loverustvip.use",
+    "oxide.grant user {steamid64} vipwall.use",
+    "oxide.grant user {steamid64} loverustvip.rainbow"
   ]
 };
 
@@ -109,11 +113,17 @@ function parseSkuToGrant(skuCandidate) {
 
 function buildGrantCommands({ steamid64, kind, duration }) {
   if (!steamid64 || !kind || !duration) return [];
-  const baseGrant = `loverustvip.grant ${steamid64} ${duration}`;
   if (kind === "rainbow") {
-    return [baseGrant, `loverustvip.setcolor ${steamid64} rainbow`];
+    return [
+      `oxide.grant user ${steamid64} loverustvip.use`,
+      `oxide.grant user ${steamid64} vipwall.use`,
+      `oxide.grant user ${steamid64} loverustvip.rainbow`
+    ];
   }
-  return [baseGrant];
+  return [
+    `oxide.grant user ${steamid64} loverustvip.use`,
+    `oxide.grant user ${steamid64} vipwall.use`
+  ];
 }
 
 function resolveRconCommands({ effectiveSku, steamid64, grant } = {}) {
