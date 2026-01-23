@@ -6,6 +6,11 @@ const SKU_ALIASES = {
   rainbow10m: "rainbow_10m"
 };
 
+const SKU_ALIASES = {
+  vip30d: "vip_30d",
+  rainbow30d: "rainbow_30d"
+};
+
 const RCON_PRODUCT_MAP = {
   vip_30d: ["loverustvip.grant {steamid64} 30d"],
   rainbow_30d: ["loverustvip.grantrainbow {steamid64} 30d"],
