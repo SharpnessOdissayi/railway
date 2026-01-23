@@ -6,7 +6,11 @@ import path from "node:path";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import WebSocket from "ws";
-import { resolveRconCommands } from "./tranzilaProducts.js";
+import {
+  resolveCanonicalSku,
+  resolveEffectiveSku,
+  resolveRconCommands
+} from "./tranzilaProducts.js";
 
 console.log("BOOT: LoveRustPayBridge v2026-01-22-RCON-OPTIONAL");
 
@@ -70,7 +74,7 @@ if (!hasDiscordWebhook) {
 }
 
 const DATABASE_PATH = DB_PATH || "./data.sqlite";
-const PROCESSED_TX_PATH = path.resolve("./data/processed.json");
+const PROCESSED_TTL_MS = 24 * 60 * 60 * 1000;
 
 const SKU_MAP = {
   vip_30d: {
@@ -313,33 +317,35 @@ function normalizeNotifyFields(req) {
     "steamId",
     "custom1"
   ]);
-  const product = pickFirstFromSources(sources, [
-    "product",
-    "sku",
+  const custom2 = pickFirstFromSources(sources, ["custom2"]);
+  const pdesc = pickFirstFromSources(sources, [
     "pdesc",
     "plan",
     "description"
   ]);
+  const product = pickFirstFromSources(sources, ["product", "sku"]);
   const amount = pickFirstFromSources(sources, ["sum", "amount", "total"]);
   const status = pickFirstFromSources(sources, ["status", "Response", "response"]);
   const responseCode = pickFirstFromSources(sources, ["Response", "response"]);
   const txnIdResult = pickFirstFromSourcesWithKey(sources, [
-    "tx",
+    "ConfirmationCode",
+    "Tempref",
     "txnId",
     "transaction_id",
     "tranId",
     "transId",
-    "ConfirmationCode",
+    "tx",
     "index",
     "orderid",
     "orderId",
-    "id",
-    "Tempref"
+    "id"
   ]);
 
   return {
     body,
     steamid64,
+    custom2,
+    pdesc,
     product,
     amount,
     status,
@@ -372,40 +378,25 @@ function isApprovedStatus(status, responseCode) {
   });
 }
 
-const RCON_PRODUCT_MAP = {
-  test_vip: [
-    "loverustvip.grantrainbow {steamid64} 10m"
-  ],
-  vip_30: ["loverustvip.grant {steamid64} 30d"],
-  rainbow_30: [
-    "loverustvip.grant {steamid64} 30d",
-    "oxide.grant user {steamid64} vip.rainbow"
-  ]
-};
+const processedTxCache = new Map();
 
-async function loadProcessedTxIds() {
-  try {
-    const content = await fs.readFile(PROCESSED_TX_PATH, "utf8");
-    const parsed = JSON.parse(content);
-    if (Array.isArray(parsed)) {
-      return new Set(parsed.map((value) => String(value)));
+function pruneProcessedTxCache(now = Date.now()) {
+  for (const [key, timestamp] of processedTxCache.entries()) {
+    if (now - timestamp > PROCESSED_TTL_MS) {
+      processedTxCache.delete(key);
     }
-    return new Set();
-  } catch (err) {
-    if (err.code !== "ENOENT") {
-      console.warn("Failed to read processed tx file:", err?.message || err);
-    }
-    return new Set();
   }
 }
 
-async function persistProcessedTxIds(txIds) {
-  await fs.mkdir(path.dirname(PROCESSED_TX_PATH), { recursive: true });
-  const payload = JSON.stringify([...txIds], null, 2);
-  await fs.writeFile(PROCESSED_TX_PATH, payload, "utf8");
+function hasProcessedTx(txnKey, now = Date.now()) {
+  pruneProcessedTxCache(now);
+  return processedTxCache.has(txnKey);
 }
 
-const processedTxIdsPromise = loadProcessedTxIds();
+function markProcessedTx(txnKey, now = Date.now()) {
+  pruneProcessedTxCache(now);
+  processedTxCache.set(txnKey, now);
+}
 const STATUS_CACHE_TTL_MS = 10 * 1000;
 const STATUS_RAW_MAX = 600;
 const STATUS_TIMEZONE = "Asia/Jerusalem";
@@ -780,6 +771,8 @@ app.post("/tranzila/notify", async (req, res) => {
     const {
       body,
       steamid64,
+      custom2,
+      pdesc,
       product,
       amount,
       status,
@@ -788,7 +781,11 @@ app.post("/tranzila/notify", async (req, res) => {
       txnIdSource
     } = normalized;
     const logTxnId = isSensitiveLogKey(txnIdSource) ? "(redacted)" : truncateLog(txnId);
-    const { resolvedProduct, templates: commands } = resolveRconCommands(product, steamid64);
+    const resolvedSku = resolveCanonicalSku({ custom2, pdesc, product });
+    const { effectiveSku, reason: testReason } = resolveEffectiveSku(
+      resolvedSku,
+      process.env.TEST_TARGET
+    );
 
     console.log("Body keys:", Object.keys(body || {}));
 
@@ -802,7 +799,8 @@ app.post("/tranzila/notify", async (req, res) => {
     console.log("Notify normalized:", {
       steamid64: truncateLog(steamid64),
       product: truncateLog(product),
-      resolvedProduct: truncateLog(resolvedProduct),
+      resolvedSku: truncateLog(resolvedSku),
+      effectiveSku: truncateLog(effectiveSku),
       status: truncateLog(status),
       txnId: logTxnId,
       amount: truncateLog(amount),
@@ -851,31 +849,39 @@ app.post("/tranzila/notify", async (req, res) => {
       return res.status(400).json({ ok: false, reason: "missing_txId" });
     }
 
-    const processedTxIds = await processedTxIdsPromise;
-    if (processedTxIds.has(txnId)) {
+    if (hasProcessedTx(txnId)) {
       console.log(`Duplicate txnId ignored: ${logTxnId}`);
       return res.status(200).json({
         ok: true,
         txId: txnId,
         steamid64,
-        product: resolvedProduct || product,
+        product: resolvedSku || product,
         actions: [],
-        duplicate: true
+        deduped: true
       });
     }
 
-    if (!resolvedProduct) {
-      return res.status(400).json({ ok: false, reason: "missing_product" });
+    if (!resolvedSku) {
+      return res.status(200).json({ ok: false, reason: "unknown_product" });
     }
 
+    if (testReason) {
+      return res.status(200).json({ ok: false, reason: testReason });
+    }
+
+    const { commands } = resolveRconCommands({
+      effectiveSku,
+      steamid64
+    });
     if (!commands.length) {
       console.warn("Notify rejected: unknown product", {
         steamid64,
         product,
-        resolvedProduct,
+        resolvedSku,
+        effectiveSku,
         txnId: logTxnId
       });
-      return res.status(400).json({ ok: false, reason: "unknown_product" });
+      return res.status(200).json({ ok: false, reason: "unknown_product" });
     }
 
     if (!isRconConfigured) {
@@ -883,21 +889,25 @@ app.post("/tranzila/notify", async (req, res) => {
     }
     try {
       const actions = [];
+      console.log("Notify grant plan:", {
+        resolvedSku,
+        effectiveSku,
+        rconCommands: commands,
+        responseCode: truncateLog(responseCode)
+      });
       for (const command of commands) {
-        const resolvedCommand = command.replace("{steamid64}", steamid64);
-        console.log(`resolvedProduct=${resolvedProduct} command=${resolvedCommand}`);
-        const result = await rconSend(resolvedCommand, { timeoutMs: 4000 });
+        console.log(`resolvedSku=${resolvedSku} command=${command}`);
+        const result = await rconSend(command, { timeoutMs: 4000 });
         console.log("RCON result:", result);
-        actions.push({ command: resolvedCommand, result });
+        actions.push({ command, result });
       }
 
-      processedTxIds.add(txnId);
-      await persistProcessedTxIds(processedTxIds);
+      markProcessedTx(txnId);
       await discordNotify({
-        content: `✅ VIP granted\nSteamID: ${steamid64}\nProduct: ${resolvedProduct}\nAmount: ${amount || "(unknown)"}\nTxn: ${txnId}`,
+        content: `✅ Grant applied\nSteamID: ${steamid64}\nProduct: ${effectiveSku}\nAmount: ${amount || "(unknown)"}\nTxn: ${txnId}`,
         txnId,
         steamid64,
-        product: resolvedProduct,
+        product: effectiveSku,
         amount
       });
 
@@ -905,7 +915,7 @@ app.post("/tranzila/notify", async (req, res) => {
         ok: true,
         txId: txnId,
         steamid64,
-        product: resolvedProduct,
+        product: effectiveSku,
         actions
       });
     } catch (err) {
