@@ -378,17 +378,185 @@ async function persistProcessedTxIds(txIds) {
 const processedTxIdsPromise = loadProcessedTxIds();
 const STATUS_CACHE_TTL_MS = 10 * 1000;
 const STATUS_RAW_MAX = 600;
-const STATUS_DAY_KEY_TIMEZONE = "UTC";
+const STATUS_TIMEZONE = "Asia/Jerusalem";
+const STATUS_DAY_START_HOUR = 5;
 const statusCache = {
   value: null,
   expiresAt: 0,
   inflight: null
 };
-const statusPeak = {
-  dayKey: new Date().toISOString().slice(0, 10),
-  peakToday: null,
-  peakTodayUpdatedAt: null
+const statusState = {
+  lastKnownMax: 0
 };
+
+function getZonedDateParts(date, timeZone) {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  });
+  const parts = formatter.formatToParts(date);
+  const result = {};
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      result[part.type] = part.value;
+    }
+  }
+  return {
+    year: result.year,
+    month: result.month,
+    day: result.day,
+    hour: Number.parseInt(result.hour, 10),
+    minute: Number.parseInt(result.minute, 10)
+  };
+}
+
+class PeakTracker {
+  constructor({ storagePath, timeZone, dayStartHour }) {
+    this.storagePath = storagePath;
+    this.timeZone = timeZone;
+    this.dayStartHour = dayStartHour;
+    this.dayKey = null;
+    this.peakToday = null;
+    this.peakTodayUpdatedAt = null;
+    this.warnedNoStorage = false;
+  }
+
+  computeDayKey(now = new Date(), timeZone = this.timeZone, dayStartHour = this.dayStartHour) {
+    const parts = getZonedDateParts(now, timeZone);
+    const beforeDayStart = parts.hour < dayStartHour;
+    if (!beforeDayStart) {
+      return `${parts.year}-${parts.month}-${parts.day}`;
+    }
+    const previousDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const previousParts = getZonedDateParts(previousDate, timeZone);
+    return `${previousParts.year}-${previousParts.month}-${previousParts.day}`;
+  }
+
+  async load() {
+    if (!this.storagePath) {
+      this.warnNoStorage();
+      return;
+    }
+    try {
+      const raw = await fs.readFile(this.storagePath, "utf8");
+      const parsed = JSON.parse(raw);
+      this.dayKey = typeof parsed?.dayKey === "string" ? parsed.dayKey : null;
+      this.peakToday = Number.isFinite(parsed?.peakToday) ? parsed.peakToday : null;
+      this.peakTodayUpdatedAt = parsed?.peakTodayUpdatedAt || null;
+      console.log("PeakTracker load success:", {
+        path: this.storagePath,
+        dayKey: this.dayKey,
+        peakToday: this.peakToday
+      });
+    } catch (err) {
+      if (err.code === "ENOENT") {
+        console.log("PeakTracker storage not found; starting fresh:", this.storagePath);
+      } else {
+        console.warn("PeakTracker load failed:", err?.message || err);
+      }
+    }
+  }
+
+  async save() {
+    if (!this.storagePath) {
+      this.warnNoStorage();
+      return;
+    }
+    try {
+      await fs.mkdir(path.dirname(this.storagePath), { recursive: true });
+      const payload = JSON.stringify(
+        {
+          dayKey: this.dayKey,
+          peakToday: this.peakToday,
+          peakTodayUpdatedAt: this.peakTodayUpdatedAt
+        },
+        null,
+        2
+      );
+      await fs.writeFile(this.storagePath, payload, "utf8");
+      console.log("PeakTracker save success:", {
+        path: this.storagePath,
+        dayKey: this.dayKey,
+        peakToday: this.peakToday
+      });
+    } catch (err) {
+      console.warn("PeakTracker save failed:", err?.message || err);
+    }
+  }
+
+  warnNoStorage() {
+    if (this.warnedNoStorage) return;
+    this.warnedNoStorage = true;
+    console.warn("No persistent storage configured; peak resets on restart.");
+  }
+
+  async ensureCurrentDay(now = new Date()) {
+    const computedDayKey = this.computeDayKey(now);
+    if (this.dayKey === computedDayKey) return false;
+    const previousDayKey = this.dayKey;
+    const previousPeak = Number.isFinite(this.peakToday) ? this.peakToday : 0;
+    this.dayKey = computedDayKey;
+    this.peakToday = 0;
+    this.peakTodayUpdatedAt = now.toISOString();
+    console.log(
+      "PeakTracker day rollover:",
+      `${previousDayKey || "(none)"} -> ${computedDayKey}`,
+      `peak ${previousPeak} -> reset`
+    );
+    await this.save();
+    return true;
+  }
+
+  async update(online, now = new Date()) {
+    await this.ensureCurrentDay(now);
+    if (!Number.isFinite(online)) return;
+    const currentPeak = Number.isFinite(this.peakToday) ? this.peakToday : 0;
+    if (online > currentPeak) {
+      this.peakToday = online;
+      this.peakTodayUpdatedAt = now.toISOString();
+      await this.save();
+    }
+  }
+
+  getPeakForResponse() {
+    const peak = Number.isFinite(this.peakToday) ? this.peakToday : 0;
+    return Math.max(10, peak);
+  }
+}
+
+async function resolvePeakStoragePath() {
+  const candidates = [];
+  if (process.env.VOLUME_PATH) {
+    candidates.push(process.env.VOLUME_PATH);
+  }
+  candidates.push("/data");
+  for (const candidate of candidates) {
+    try {
+      const stats = await fs.stat(candidate);
+      if (stats.isDirectory()) {
+        return path.join(candidate, "peak.json");
+      }
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        console.warn("Peak storage path check failed:", err?.message || err);
+      }
+    }
+  }
+  return null;
+}
+
+const peakStoragePath = await resolvePeakStoragePath();
+const peakTracker = new PeakTracker({
+  storagePath: peakStoragePath,
+  timeZone: STATUS_TIMEZONE,
+  dayStartHour: STATUS_DAY_START_HOUR
+});
+const peakTrackerReady = peakTracker.load();
 
 function readStatusCache() {
   if (!statusCache.value) return null;
@@ -413,40 +581,14 @@ function formatStatusPayload({ ok, online, max, raw, error }) {
     ok: Boolean(ok),
     online: Number.isFinite(online) ? online : null,
     max: Number.isFinite(max) ? max : null,
-    peakToday: Number.isFinite(statusPeak.peakToday) ? statusPeak.peakToday : null,
-    peakTodayUpdatedAt: statusPeak.peakTodayUpdatedAt,
-    dayKey: statusPeak.dayKey,
+    peakToday: peakTracker.getPeakForResponse(),
+    peakTodayUpdatedAt: peakTracker.peakTodayUpdatedAt,
+    dayKey: peakTracker.dayKey,
     updatedAt: new Date().toISOString()
   };
   if (raw) payload.raw = truncateRawStatus(raw);
   if (error) payload.error = error;
   return payload;
-}
-
-function getStatusDayKey(date = new Date()) {
-  if (STATUS_DAY_KEY_TIMEZONE === "UTC") {
-    return date.toISOString().slice(0, 10);
-  }
-  return date.toISOString().slice(0, 10);
-}
-
-function updatePeakToday(online) {
-  const now = new Date();
-  const dayKey = getStatusDayKey(now);
-  const hasPeakToday = Number.isFinite(statusPeak.peakToday);
-
-  if (!hasPeakToday || statusPeak.dayKey !== dayKey) {
-    statusPeak.dayKey = dayKey;
-    statusPeak.peakToday = Number.isFinite(online) ? online : 0;
-    statusPeak.peakTodayUpdatedAt = now.toISOString();
-    return;
-  }
-
-  const currentPeak = Number.isFinite(statusPeak.peakToday) ? statusPeak.peakToday : 0;
-  if (online > currentPeak) {
-    statusPeak.peakToday = online;
-    statusPeak.peakTodayUpdatedAt = now.toISOString();
-  }
 }
 
 function parsePlayerCounts(raw) {
@@ -481,11 +623,13 @@ function parsePlayerCounts(raw) {
 }
 
 async function fetchServerStatus() {
+  await peakTrackerReady;
+  await peakTracker.ensureCurrentDay();
   if (!isRconConfigured) {
     const payload = formatStatusPayload({
-      ok: false,
-      online: null,
-      max: null,
+      ok: true,
+      online: 0,
+      max: statusState.lastKnownMax || 0,
       error: "rcon_not_configured"
     });
     writeStatusCache(payload);
@@ -497,15 +641,16 @@ async function fetchServerStatus() {
     const raw = result?.raw || "";
     const { online, max } = parsePlayerCounts(raw);
     if (Number.isFinite(online) && Number.isFinite(max)) {
-      updatePeakToday(online);
+      statusState.lastKnownMax = max;
+      await peakTracker.update(online);
       const payload = formatStatusPayload({ ok: true, online, max, raw });
       writeStatusCache(payload);
       return payload;
     }
     const payload = formatStatusPayload({
-      ok: false,
-      online: null,
-      max: null,
+      ok: true,
+      online: 0,
+      max: statusState.lastKnownMax || 0,
       raw,
       error: "parse_failed"
     });
@@ -513,9 +658,9 @@ async function fetchServerStatus() {
     return payload;
   } catch (err) {
     const payload = formatStatusPayload({
-      ok: false,
-      online: null,
-      max: null,
+      ok: true,
+      online: 0,
+      max: statusState.lastKnownMax || 0,
       error: "rcon_unreachable"
     });
     writeStatusCache(payload);
@@ -529,6 +674,7 @@ app.options("/server/status", (_req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Cache-Control", "no-store, max-age=0");
   return res.status(204).send();
 });
 app.get("/server/status", async (req, res) => {
@@ -537,8 +683,16 @@ app.get("/server/status", async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Vary", "Origin");
+  res.setHeader("Cache-Control", "no-store, max-age=0");
 
   try {
+    await peakTrackerReady;
+    const dayChanged = await peakTracker.ensureCurrentDay();
+    if (dayChanged) {
+      statusCache.value = null;
+      statusCache.expiresAt = 0;
+    }
+
     const cached = readStatusCache();
     if (cached) {
       return res.status(200).json(cached);
@@ -559,9 +713,9 @@ app.get("/server/status", async (req, res) => {
   } catch (err) {
     console.warn("Status endpoint error:", err?.message || err);
     const payload = formatStatusPayload({
-      ok: false,
-      online: null,
-      max: null,
+      ok: true,
+      online: 0,
+      max: statusState.lastKnownMax || 0,
       error: "server_error"
     });
     writeStatusCache(payload);
