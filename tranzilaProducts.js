@@ -1,20 +1,21 @@
-const CANONICAL_SKUS = ["vip_30d", "rainbow_30d", "rainbow_10m"];
+const CANONICAL_SKUS = ["vip_30d", "rainbow_30d"];
 
 const SKU_ALIASES = {
   vip30d: "vip_30d",
   rainbow30d: "rainbow_30d",
-  rainbow10m: "rainbow_10m"
+  rainbow10m: "rainbow_30d",
+  rainbow_10m: "rainbow_30d"
 };
 
 const RCON_PRODUCT_MAP = {
-  vip_30d: ["loverustvip.grant {steamid64} 30d"],
-  rainbow_30d: [
-    "loverustvip.grant {steamid64} 30d",
-    "loverustvip.setcolor {steamid64} rainbow"
+  vip_30d: [
+    "oxide.grant user {steamid64} loverustvip.use",
+    "oxide.grant user {steamid64} vipwall.use"
   ],
-  rainbow_10m: [
-    "loverustvip.grant {steamid64} 10m",
-    "loverustvip.setcolor {steamid64} rainbow"
+  rainbow_30d: [
+    "oxide.grant user {steamid64} loverustvip.use",
+    "oxide.grant user {steamid64} vipwall.use",
+    "oxide.grant user {steamid64} loverustvip.rainbow"
   ]
 };
 
@@ -112,11 +113,17 @@ function parseSkuToGrant(skuCandidate) {
 
 function buildGrantCommands({ steamid64, kind, duration }) {
   if (!steamid64 || !kind || !duration) return [];
-  const baseGrant = `loverustvip.grant ${steamid64} ${duration}`;
   if (kind === "rainbow") {
-    return [baseGrant, `loverustvip.setcolor ${steamid64} rainbow`];
+    return [
+      `oxide.grant user ${steamid64} loverustvip.use`,
+      `oxide.grant user ${steamid64} vipwall.use`,
+      `oxide.grant user ${steamid64} loverustvip.rainbow`
+    ];
   }
-  return [baseGrant];
+  return [
+    `oxide.grant user ${steamid64} loverustvip.use`,
+    `oxide.grant user ${steamid64} vipwall.use`
+  ];
 }
 
 function resolveRconCommands({ effectiveSku, steamid64, grant } = {}) {
