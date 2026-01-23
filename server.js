@@ -7,6 +7,7 @@ import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import WebSocket from "ws";
 import {
+  parseSkuToGrant,
   resolveCanonicalSku,
   resolveRconCommands
 } from "./tranzilaProducts.js";
@@ -787,7 +788,26 @@ app.post("/tranzila/notify", async (req, res) => {
       product: rawProduct || product,
       plan: rawPlan || plan
     });
-    const effectiveSku = resolvedSku;
+    const skuCandidate =
+      pickFirst(
+        {
+          custom2: rawCustom2 || custom2,
+          pdesc: rawPdesc || pdesc,
+          resolvedSku,
+          product: rawProduct || product,
+          plan: rawPlan || plan
+        },
+        ["custom2", "pdesc", "resolvedSku", "product", "plan"]
+      ) || "";
+    const parsedGrant = parseSkuToGrant(skuCandidate);
+    const grant = parsedGrant.result;
+    const effectiveSku = grant?.effectiveSku || resolvedSku;
+    const normalizedProduct = grant?.kind || "";
+    const normalizedDuration = grant?.duration || "";
+    if (grant) {
+      normalized.product = grant.kind;
+      normalized.duration = grant.duration;
+    }
 
     console.log("Body keys:", Object.keys(body || {}));
 
@@ -808,6 +828,8 @@ app.post("/tranzila/notify", async (req, res) => {
       product: truncateLog(product),
       resolvedSku: truncateLog(resolvedSku),
       effectiveSku: truncateLog(effectiveSku),
+      kind: truncateLog(normalizedProduct),
+      duration: truncateLog(normalizedDuration),
       status: truncateLog(status),
       txnId: logTxnId,
       amount: truncateLog(amount),
@@ -868,13 +890,24 @@ app.post("/tranzila/notify", async (req, res) => {
       });
     }
 
-    if (!resolvedSku) {
-      return res.status(200).json({ ok: false, reason: "unknown_product" });
+    if (!grant && !resolvedSku) {
+      console.warn(
+        `[SKU] Unrecognized sku="${truncateLog(skuCandidate)}" sources: custom2="${truncateLog(rawCustom2)}" pdesc="${truncateLog(rawPdesc)}" reason=${parsedGrant.reason || "unknown"}`
+      );
+      return res.status(200).json({
+        ok: true,
+        granted: false,
+        sku: skuCandidate || "",
+        kind: null,
+        duration: null,
+        reason: "unknown_product"
+      });
     }
 
     const { commands } = resolveRconCommands({
       effectiveSku,
-      steamid64
+      steamid64,
+      grant
     });
     if (!commands.length) {
       console.warn("Notify rejected: unknown product", {
@@ -884,7 +917,14 @@ app.post("/tranzila/notify", async (req, res) => {
         effectiveSku,
         txnId: logTxnId
       });
-      return res.status(200).json({ ok: false, reason: "unknown_product" });
+      return res.status(200).json({
+        ok: true,
+        granted: false,
+        sku: skuCandidate || effectiveSku || "",
+        kind: grant?.kind || null,
+        duration: grant?.duration || null,
+        reason: "unknown_product"
+      });
     }
 
     if (!isRconConfigured) {
@@ -901,6 +941,17 @@ app.post("/tranzila/notify", async (req, res) => {
         rconCommands: commands,
         responseCode: truncateLog(responseCode)
       });
+      const grantLogParts = [
+        `steamid=${steamid64}`,
+        `sku=${truncateLog(skuCandidate)}`,
+        `kind=${grant?.kind || normalizedProduct || "unknown"}`,
+        `duration=${grant?.duration || normalizedDuration || "unknown"}`,
+        `cmd1=${commands[0] || ""}`
+      ];
+      if (commands[1]) {
+        grantLogParts.push(`cmd2=${commands[1]}`);
+      }
+      console.log(`[GRANT] ${grantLogParts.join(" ")}`);
       for (const command of commands) {
         console.log(`resolvedSku=${resolvedSku} command=${command}`);
         const result = await rconSend(command, { timeoutMs: 4000 });
@@ -919,9 +970,13 @@ app.post("/tranzila/notify", async (req, res) => {
 
       return res.status(200).json({
         ok: true,
+        granted: true,
         txId: txnId,
         steamid64,
         product: effectiveSku,
+        kind: grant?.kind || normalizedProduct || null,
+        duration: grant?.duration || normalizedDuration || null,
+        sku: skuCandidate || effectiveSku || "",
         actions
       });
     } catch (err) {
