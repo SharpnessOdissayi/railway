@@ -1,0 +1,111 @@
+# LoveRust Pay Bridge (Backend)
+
+This service receives Tranzila notify calls and grants VIP via Rust RCON. It supports both JSON and `application/x-www-form-urlencoded` payloads.
+
+## Environment variables
+
+| Name | Required | Description |
+| --- | --- | --- |
+| `API_SECRET` | yes | Shared secret for legacy endpoints (required at boot). |
+| `TRAZNILA_NOTIFY_SECRET` | no | If set, `/tranzila/notify` requires this token. |
+| `RCON_HOST` | yes | Rust RCON host. |
+| `RCON_PORT` | yes | Rust RCON port. |
+| `RCON_PASSWORD` | yes | Rust RCON password. |
+| `DB_PATH` | no | SQLite path (defaults to `./data.sqlite`). |
+| `DISCORD_WEBHOOK_URL` | no | Discord webhook for notifications. |
+| `DRY_RUN` | no | If `true`, RCON commands are logged instead of executed. |
+| `PORT` | no | HTTP port (defaults to `8080`). |
+
+Processed Tranzila transaction IDs are stored in `./data/processed.json` to prevent double grants.
+
+## Tranzila notify endpoint
+
+`POST /tranzila/notify`
+
+Supported content types:
+- `application/json`
+- `application/x-www-form-urlencoded`
+
+Field normalization:
+- `steamid64`: `steamid64`, `contact`, `steam_id`, `steamId`, `custom1`
+- `product`: `product`, `sku`, `pdesc`, `plan`, `description`
+- `amount`: `sum`, `amount`, `total`
+- `status/approval`: `Response` (`000` approved) or `status` (`approved`, `ok`, `success`, or `0/00/000`)
+- `txId`: `tx`, `txnId`, `transaction_id`, `tranId`, `transId`, `ConfirmationCode`, `index`, `orderid`, `orderId`, `id`, `Tempref`
+
+Product mapping:
+- `test-vip` / `test_vip` → `loverustvip.grant <steamid64> 10m`
+- `vip_30` → `loverustvip.grant <steamid64> 30d`
+- `rainbow_30` → `loverustvip.grant <steamid64> 30d` + `oxide.grant user <steamid64> vip.rainbow`
+
+### Tranzila settings
+
+Configure the Tranzila "Notify URL" to:
+```
+https://<your-domain>/tranzila/notify
+```
+
+Ensure Tranzila sends:
+- `Response=000`
+- `contact=<steamid64>`
+- `sku=test-vip`
+- `sum=0.01`
+- `ConfirmationCode` or `index` (used as `txId`)
+
+## Local test commands
+
+### curl (JSON)
+```bash
+curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "Response": "000",
+    "contact": "76561198000000000",
+    "sku": "test-vip",
+    "sum": "0.01",
+    "ConfirmationCode": "tx-123"
+  }'
+```
+
+### curl (form-urlencoded)
+```bash
+curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "Response=000" \
+  --data-urlencode "contact=76561198000000000" \
+  --data-urlencode "sku=test_vip" \
+  --data-urlencode "sum=0.01" \
+  --data-urlencode "index=tx-456"
+```
+
+### PowerShell (JSON)
+```powershell
+$body = @{
+  Response = "000"
+  contact = "76561198000000000"
+  sku = "test-vip"
+  sum = "0.01"
+  ConfirmationCode = "tx-789"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+### PowerShell (form-urlencoded)
+```powershell
+$form = @{
+  Response = "000"
+  contact = "76561198000000000"
+  sku = "vip_30"
+  sum = "1.00"
+  index = "tx-987"
+}
+
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" `
+  -ContentType "application/x-www-form-urlencoded" `
+  -Body $form
+```
