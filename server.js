@@ -374,7 +374,12 @@ function isApprovedStatus(status, responseCode) {
   });
 }
 
+function isIdempotentSource(_req) {
+  return true;
+}
+
 const processedTxCache = new Map();
+const recentTxIds = new Map();
 
 function pruneProcessedTxCache(now = Date.now()) {
   for (const [key, timestamp] of processedTxCache.entries()) {
@@ -392,6 +397,10 @@ function hasProcessedTx(txnKey, now = Date.now()) {
 function markProcessedTx(txnKey, now = Date.now()) {
   pruneProcessedTxCache(now);
   processedTxCache.set(txnKey, now);
+}
+
+function markRecentTxId(txnKey, status, now = Date.now()) {
+  recentTxIds.set(txnKey, { status, at: now });
 }
 const STATUS_CACHE_TTL_MS = 10 * 1000;
 const STATUS_RAW_MAX = 600;
@@ -931,7 +940,7 @@ app.post("/tranzila/notify", async (req, res) => {
       return res.status(502).json({ ok: false, reason: "rcon_not_configured" });
     }
     try {
-      if (isIdempotentSource) {
+      if (isIdempotentSource(req)) {
         markRecentTxId(txnId, "inflight");
       }
       const actions = [];
@@ -958,6 +967,11 @@ app.post("/tranzila/notify", async (req, res) => {
         console.log("RCON result:", result);
         actions.push({ command, result });
       }
+      console.log("RCON commands executed", {
+        count: commands.length,
+        steamid64: truncateLog(steamid64),
+        txnId: logTxnId
+      });
 
       markProcessedTx(txnId);
       await discordNotify({
@@ -981,7 +995,7 @@ app.post("/tranzila/notify", async (req, res) => {
       });
     } catch (err) {
       console.warn("Notify rejected: rcon_failed", err?.message || err);
-      if (isIdempotentSource) {
+      if (isIdempotentSource(req)) {
         recentTxIds.delete(txnId);
       }
       return res.status(502).json({ ok: false, reason: "rcon_failed" });
