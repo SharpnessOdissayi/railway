@@ -1,16 +1,16 @@
 const PRODUCT_ALIASES = {
   vip_rainbow: "vip_rainbow",
-  "vip-rainbow": "vip_rainbow"
+  "vip-rainbow": "vip_rainbow",
+  rainbow: "rainbow_30",
+  "cosmetic-rainbow": "rainbow_30",
+  "cosmetic_rainbow": "rainbow_30"
 };
 
 const RCON_PRODUCT_MAP = {
   test_vip: ["loverustvip.grant {steamid64} 10m"],
   vip_rainbow: ["loverustvip.grantrainbow {steamid64} 30d"],
   vip_30: ["loverustvip.grant {steamid64} 30d"],
-  rainbow_30: [
-    "loverustvip.grant {steamid64} 30d",
-    "oxide.grant user {steamid64} vip.rainbow"
-  ]
+  rainbow_30: ["loverustvip.grantrainbow {steamid64} 30d"]
 };
 
 function normalizeProduct(product) {

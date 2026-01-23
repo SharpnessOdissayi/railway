@@ -372,15 +372,29 @@ function isApprovedStatus(status, responseCode) {
   });
 }
 
+function isIdempotentTxSource(source) {
+  const key = String(source || "").trim().toLowerCase();
+  return key === "confirmationcode" || key === "tempref";
+}
+
+function pruneRecentTxIds(now = Date.now()) {
+  for (const [txId, entry] of recentTxIds.entries()) {
+    if (now - entry.timestamp > DEDUPE_TTL_MS) {
+      recentTxIds.delete(txId);
+    }
+  }
+}
+
+function markRecentTxId(txId, status, now = Date.now()) {
+  recentTxIds.set(txId, { timestamp: now, status });
+}
+
 const RCON_PRODUCT_MAP = {
   test_vip: [
     "loverustvip.grantrainbow {steamid64} 10m"
   ],
   vip_30: ["loverustvip.grant {steamid64} 30d"],
-  rainbow_30: [
-    "loverustvip.grant {steamid64} 30d",
-    "oxide.grant user {steamid64} vip.rainbow"
-  ]
+  rainbow_30: ["loverustvip.grantrainbow {steamid64} 30d"]
 };
 
 async function loadProcessedTxIds() {
@@ -406,6 +420,8 @@ async function persistProcessedTxIds(txIds) {
 }
 
 const processedTxIdsPromise = loadProcessedTxIds();
+const DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
+const recentTxIds = new Map();
 const STATUS_CACHE_TTL_MS = 10 * 1000;
 const STATUS_RAW_MAX = 600;
 const STATUS_TIMEZONE = "Asia/Jerusalem";
@@ -864,6 +880,24 @@ app.post("/tranzila/notify", async (req, res) => {
       });
     }
 
+    const isIdempotentSource = isIdempotentTxSource(txnIdSource);
+    if (isIdempotentSource) {
+      pruneRecentTxIds();
+      const recent = recentTxIds.get(txnId);
+      if (recent) {
+        console.log(`Duplicate txnId (recent) ignored: ${logTxnId}`);
+        return res.status(200).json({
+          ok: true,
+          txId: txnId,
+          steamid64,
+          product: resolvedProduct || product,
+          actions: [],
+          duplicate: true,
+          duplicateSource: "recent"
+        });
+      }
+    }
+
     if (!resolvedProduct) {
       return res.status(400).json({ ok: false, reason: "missing_product" });
     }
@@ -882,6 +916,9 @@ app.post("/tranzila/notify", async (req, res) => {
       return res.status(502).json({ ok: false, reason: "rcon_not_configured" });
     }
     try {
+      if (isIdempotentSource) {
+        markRecentTxId(txnId, "inflight");
+      }
       const actions = [];
       for (const command of commands) {
         const resolvedCommand = command.replace("{steamid64}", steamid64);
@@ -893,8 +930,11 @@ app.post("/tranzila/notify", async (req, res) => {
 
       processedTxIds.add(txnId);
       await persistProcessedTxIds(processedTxIds);
+      if (isIdempotentSource) {
+        markRecentTxId(txnId, "processed");
+      }
       await discordNotify({
-        content: `✅ VIP granted\nSteamID: ${steamid64}\nProduct: ${resolvedProduct}\nAmount: ${amount || "(unknown)"}\nTxn: ${txnId}`,
+        content: `✅ Purchase fulfilled\nSteamID: ${steamid64}\nProduct: ${resolvedProduct}\nAmount: ${amount || "(unknown)"}\nTxn: ${txnId}`,
         txnId,
         steamid64,
         product: resolvedProduct,
@@ -910,6 +950,9 @@ app.post("/tranzila/notify", async (req, res) => {
       });
     } catch (err) {
       console.warn("Notify rejected: rcon_failed", err?.message || err);
+      if (isIdempotentSource) {
+        recentTxIds.delete(txnId);
+      }
       return res.status(502).json({ ok: false, reason: "rcon_failed" });
     }
   } catch (err) {
