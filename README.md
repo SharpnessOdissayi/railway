@@ -129,3 +129,14 @@ Invoke-RestMethod -Method Post `
   -ContentType "application/x-www-form-urlencoded" `
   -Body $form
 ```
+
+## Server status endpoint
+
+`GET /server/status`
+
+Returns the live Rust player count from RCON (cached for ~10 seconds).
+
+Manual test:
+```bash
+curl https://<railway-domain>/server/status
+```
