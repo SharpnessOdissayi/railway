@@ -1,6 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
+import sqlite3 from "sqlite3";
+import { open } from "sqlite";
 import WebSocket from "ws";
 
 console.log("BOOT: LoveRustPayBridge v2026-01-22-RCON-OPTIONAL");
@@ -26,6 +28,9 @@ const {
   RCON_HOST,
   RCON_PORT,
   RCON_PASSWORD,
+
+  // Database
+  DB_PATH,
 
   // Discord
   DISCORD_WEBHOOK_URL, // recommended
@@ -57,14 +62,33 @@ if (!hasDiscordWebhook) {
   );
 }
 
-// Map products you send from Tranzila notify
-const PRODUCT_MAP = {
-  vip_30:      { action: "vip",     duration: "30d", priceLabel: "$19.90" },
-  "vip-monthly": { action: "vip",     duration: "30d", priceLabel: "$19.90" },
-  vip_monthly: { action: "vip",     duration: "30d", priceLabel: "$19.90" },
-  vipmonthly:  { action: "vip",     duration: "30d", priceLabel: "$19.90" },
-  rainbow_30:  { action: "rainbow", duration: "30d", priceLabel: "$9.90" },
-  coffee:      { action: "coffee",  duration: "perm", priceLabel: "$5.00" }
+const DATABASE_PATH = DB_PATH || "./data.sqlite";
+
+const SKU_MAP = {
+  vip_30d: {
+    type: "group",
+    rconGrant: "oxide.usergroup add {steamid64} vip",
+    rconRevoke: "oxide.usergroup remove {steamid64} vip",
+    durationSeconds: 2592000
+  },
+  vip_test_10m: {
+    type: "group",
+    rconGrant: "oxide.usergroup add {steamid64} vip",
+    rconRevoke: "oxide.usergroup remove {steamid64} vip",
+    durationSeconds: 600
+  },
+  rainbow_30d: {
+    type: "permission",
+    rconGrant: "oxide.grant user {steamid64} vip.rainbow",
+    rconRevoke: "oxide.revoke user {steamid64} vip.rainbow",
+    durationSeconds: 2592000
+  },
+  coffee_support: {
+    type: "group",
+    rconGrant: "oxide.usergroup add {steamid64} supporter",
+    rconRevoke: "oxide.usergroup remove {steamid64} supporter",
+    durationSeconds: 0
+  }
 };
 
 // Rust RCON uses WebSocket: ws://HOST:PORT/PASSWORD
@@ -104,6 +128,48 @@ async function rconSend(command) {
     });
   });
 }
+
+async function initDb() {
+  const db = await open({
+    filename: DATABASE_PATH,
+    driver: sqlite3.Database
+  });
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      txnId TEXT PRIMARY KEY,
+      steamid64 TEXT NOT NULL,
+      sku TEXT NOT NULL,
+      status TEXT NOT NULL,
+      amount TEXT,
+      createdAt TEXT NOT NULL
+    );
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS entitlements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      steamid64 TEXT NOT NULL,
+      sku TEXT NOT NULL,
+      txnId TEXT NOT NULL,
+      grantedAt TEXT NOT NULL,
+      expiresAt TEXT,
+      revokeCommand TEXT NOT NULL,
+      revokedAt TEXT
+    );
+  `);
+
+  await db.exec(
+    "CREATE INDEX IF NOT EXISTS entitlements_expiry ON entitlements (expiresAt, revokedAt);"
+  );
+
+  return db;
+}
+
+const dbPromise = initDb().catch((err) => {
+  console.error("Failed to initialize database:", err);
+  process.exit(1);
+});
 
 async function discordNotify(content) {
   if (!DISCORD_WEBHOOK_URL) return;
@@ -175,14 +241,6 @@ function normalizeNotifyFields(req) {
     "contact",
     "customer_id"
   ]);
-  const product = pickFirstFromSources(sources, [
-    "product",
-    "product_id",
-    "item",
-    "plan",
-    "description",
-    "product_description"
-  ]);
   const status = pickFirstFromSources(sources, [
     "status",
     "payment_status",
@@ -191,24 +249,15 @@ function normalizeNotifyFields(req) {
     "response",
     "response_code"
   ]);
-  const txnId = pickFirstFromSources(sources, [
-    "txn_id",
-    "transaction_id",
-    "order_id",
-    "index",
-    "confirmation_code"
-  ]);
+  const txnId = pickFirstFromSources(sources, ["txnId", "orderid", "requestId"]);
   const amount = pickFirstFromSources(sources, ["amount", "sum", "price", "total"]);
-  const responseCode = pickFirstFromSources(sources, [
-    "response_code",
-    "resp_code",
-    "responseCode"
-  ]);
+  const responseCode = pickFirstFromSources(sources, ["responseCode", "response_code", "resp_code"]);
+  const sku = pickFirstFromSources(sources, ["sku"]);
 
   return {
     body,
     steamid64,
-    product,
+    sku,
     status,
     txnId,
     amount,
@@ -228,7 +277,7 @@ app.post("/tranzila/notify", async (req, res) => {
     const {
       body,
       steamid64,
-      product,
+      sku,
       status,
       txnId,
       amount,
@@ -240,13 +289,13 @@ app.post("/tranzila/notify", async (req, res) => {
     console.log(
       "Notify summary:",
       `steamid64=${truncateLog(steamid64) || "(empty)"}`,
-      `product=${truncateLog(product) || "(empty)"}`,
+      `sku=${truncateLog(sku) || "(empty)"}`,
       `status=${truncateLog(status) || "(empty)"}`,
       `txn_id=${truncateLog(txnId) || "(empty)"}`
     );
     console.log("Notify normalized:", {
       steamid64: truncateLog(steamid64),
-      product: truncateLog(product),
+      sku: truncateLog(sku),
       status: truncateLog(status),
       txnId: truncateLog(txnId),
       amount: truncateLog(amount),
@@ -264,77 +313,108 @@ app.post("/tranzila/notify", async (req, res) => {
 
     if (!steamid64) return res.status(400).json({ ok: false, error: "missing steamid64" });
 
-    // flexible success detection
-    const s = (status || "").toLowerCase();
+    const statusNormalized = String(status || "").toLowerCase();
     const isSuccess =
-      ["success", "approved", "ok", "true"].includes(s) ||
-      ["000", "0"].includes(String(responseCode || "").toLowerCase());
+      statusNormalized === "approved" && String(responseCode || "").toLowerCase() === "000";
 
     if (!isSuccess) {
       await discordNotify(
-        `❌ Payment not successful\nSteamID: ${steamid64}\nStatus: ${status || "(empty)"}\nProduct: ${product || "(unknown)"}\nTxn: ${txnId || "(none)"}`
+        `❌ Payment not successful\nSteamID: ${steamid64}\nStatus: ${status || "(empty)"}\nResponseCode: ${responseCode || "(empty)"}\nSKU: ${sku || "(empty)"}\nTxn: ${txnId || "(none)"}`
       );
       return res.status(200).json({ ok: true, ignored: true });
     }
 
-    const mapped = PRODUCT_MAP[product];
+    if (!txnId) {
+      await discordNotify(
+        `❌ Payment missing txnId - not granting\nSteamID: ${steamid64}\nSKU: ${sku || "(empty)"}\nStatus: ${status || "(empty)"}\nResponseCode: ${responseCode || "(empty)"}`
+      );
+      return res.status(400).json({ ok: false, error: "missing_txnId" });
+    }
+
+    const db = await dbPromise;
+    const existingTxn = await db.get("SELECT txnId FROM transactions WHERE txnId = ?", txnId);
+    if (existingTxn) {
+      console.log(`Duplicate txnId ignored: ${txnId}`);
+      return res.status(200).json({ ok: true, duplicate: true, message: "duplicate ignored" });
+    }
+
+    const mapped = SKU_MAP[sku];
     if (!mapped) {
       await discordNotify(
-        `⚠️ Payment received but product is unknown\nSteamID: ${steamid64}\nProduct: ${product || "(empty)"}\nTxn: ${txnId || "(none)"}\nAction: NOT GRANTED`
+        `⚠️ Payment received but SKU is unknown\nSteamID: ${steamid64}\nSKU: ${sku || "(empty)"}\nTxn: ${txnId || "(none)"}\nAction: NOT GRANTED`
+      );
+      await db.run(
+        "INSERT INTO transactions (txnId, steamid64, sku, status, amount, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        txnId,
+        steamid64,
+        sku || "unknown",
+        "unknown_sku",
+        amount || null,
+        new Date().toISOString()
       );
       return res.status(200).json({ ok: true, unknown_product: true });
     }
 
-    let rconCommand = "";
-    let humanProduct = product;
-
-    if (mapped.action === "vip") {
-      rconCommand = `loverustvip.grant ${steamid64} ${mapped.duration}`;
-      humanProduct = `VIP (${mapped.duration})`;
-    } else if (mapped.action === "rainbow") {
-      // simplest: grant VIP and tell user to use /cc rainbow
-      rconCommand = `loverustvip.grant ${steamid64} ${mapped.duration}`;
-      humanProduct = `Rainbow Name (${mapped.duration})`;
-    } else if (mapped.action === "coffee") {
-      // donation only
-      rconCommand = "";
-      humanProduct = `Coffee (Donation)`;
-    }
+    const rconCommand = mapped.rconGrant.replace("{steamid64}", steamid64);
+    const revokeCommand = mapped.rconRevoke.replace("{steamid64}", steamid64);
+    const humanProduct = `${sku} (${mapped.type})`;
 
     let rconResult = null;
-    if (rconCommand) {
-      if (!isRconConfigured) {
-        await discordNotify(
-          `⚠️ Payment received but RCON is not configured\nSteamID: ${steamid64}\nProduct: ${humanProduct}\nTxn: ${txnId || "(none)"}\nAction: NOT GRANTED`
-        );
-        return res.status(200).json({ ok: true, granted: false, error: "rcon_not_configured" });
-      }
-      try {
-        rconResult = await rconSend(rconCommand);
-      } catch (err) {
-        await discordNotify(
-          `❌ RCON failed\nSteamID: ${steamid64}\nProduct: ${humanProduct}\nTxn: ${txnId || "(none)"}\nError: ${err?.message || "unknown"}`
-        );
-        return res.status(502).json({ ok: false, error: "rcon_failed" });
-      }
+    if (!isRconConfigured) {
+      await discordNotify(
+        `⚠️ Payment received but RCON is not configured\nSteamID: ${steamid64}\nSKU: ${sku}\nTxn: ${txnId}\nAction: NOT GRANTED`
+      );
+      return res.status(200).json({ ok: true, granted: false, error: "rcon_not_configured" });
+    }
+    try {
+      console.log(`RCON grant command: ${rconCommand}`);
+      rconResult = await rconSend(rconCommand);
+    } catch (err) {
+      await discordNotify(
+        `❌ RCON failed\nSteamID: ${steamid64}\nSKU: ${sku}\nTxn: ${txnId}\nError: ${err?.message || "unknown"}`
+      );
+      return res.status(502).json({ ok: false, error: "rcon_failed" });
+    }
+
+    await db.run(
+      "INSERT INTO transactions (txnId, steamid64, sku, status, amount, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+      txnId,
+      steamid64,
+      sku,
+      "granted",
+      amount || null,
+      new Date().toISOString()
+    );
+
+    if (mapped.durationSeconds > 0) {
+      const grantedAt = new Date();
+      const expiresAt = new Date(grantedAt.getTime() + mapped.durationSeconds * 1000);
+      await db.run(
+        `INSERT INTO entitlements (steamid64, sku, txnId, grantedAt, expiresAt, revokeCommand)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        steamid64,
+        sku,
+        txnId,
+        grantedAt.toISOString(),
+        expiresAt.toISOString(),
+        revokeCommand
+      );
     }
 
     let msg =
       `✅ **New Purchase**\n` +
       `**Player (SteamID64):** ${steamid64}\n` +
-      `**Product:** ${humanProduct}\n` +
-      (mapped.priceLabel ? `**Price:** ${mapped.priceLabel}\n` : "") +
+      `**SKU:** ${sku}\n` +
       (txnId ? `**Txn:** ${txnId}\n` : "") +
+      (amount ? `**Amount:** ${amount}\n` : "") +
       (rconCommand ? `**RCON:** \`${rconCommand}\`` : `**RCON:** (none)`);
-
-    if (mapped.action === "rainbow") msg += `\n**Note:** Player can use \`/cc rainbow\` in-game.`;
 
     await discordNotify(msg);
 
     return res.status(200).json({
       ok: true,
-      granted: !!rconCommand,
-      product,
+      granted: true,
+      sku,
       rcon: !!rconResult
     });
   } catch (err) {
@@ -387,3 +467,42 @@ app.post("/tranzila/result", async (req, res) => {
 app.listen(resolvedPort, "0.0.0.0", () => {
   console.log(`LoveRustPayBridge listening on :${resolvedPort}`);
 });
+
+async function processExpiredEntitlements() {
+  const db = await dbPromise;
+  const now = new Date().toISOString();
+  const rows = await db.all(
+    "SELECT id, steamid64, sku, txnId, revokeCommand FROM entitlements WHERE expiresAt IS NOT NULL AND revokedAt IS NULL AND expiresAt <= ?",
+    now
+  );
+
+  if (!rows.length) return;
+
+  for (const row of rows) {
+    if (!isRconConfigured) {
+      console.warn(
+        `Cannot revoke entitlement (RCON not configured). entitlementId=${row.id} sku=${row.sku}`
+      );
+      continue;
+    }
+    try {
+      console.log(`RCON revoke command: ${row.revokeCommand}`);
+      await rconSend(row.revokeCommand);
+      await db.run("UPDATE entitlements SET revokedAt = ? WHERE id = ?", new Date().toISOString(), row.id);
+      await discordNotify(
+        `🕒 Entitlement revoked\nSteamID: ${row.steamid64}\nSKU: ${row.sku}\nTxn: ${row.txnId}`
+      );
+    } catch (err) {
+      console.warn(
+        `Failed to revoke entitlement ${row.id}:`,
+        err?.message || err
+      );
+    }
+  }
+}
+
+setInterval(() => {
+  processExpiredEntitlements().catch((err) => {
+    console.error("Failed to process expired entitlements:", err);
+  });
+}, 60 * 1000);
