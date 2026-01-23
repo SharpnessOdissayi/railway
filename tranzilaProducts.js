@@ -1,4 +1,10 @@
-const CANONICAL_SKUS = ["vip_30d", "rainbow_30d", "test"];
+const CANONICAL_SKUS = ["vip_30d", "rainbow_30d", "rainbow_10m"];
+
+const SKU_ALIASES = {
+  vip30d: "vip_30d",
+  rainbow30d: "rainbow_30d",
+  rainbow10m: "rainbow_10m"
+};
 
 const SKU_ALIASES = {
   vip30d: "vip_30d",
@@ -7,7 +13,8 @@ const SKU_ALIASES = {
 
 const RCON_PRODUCT_MAP = {
   vip_30d: ["loverustvip.grant {steamid64} 30d"],
-  rainbow_30d: ["loverustvip.grantrainbow {steamid64} 30d"]
+  rainbow_30d: ["loverustvip.grantrainbow {steamid64} 30d"],
+  rainbow_10m: ["loverustvip.grantrainbow {steamid64} 10m"]
 };
 
 function normalizeSku(value) {
@@ -36,17 +43,6 @@ function resolveCanonicalSku({ custom2, pdesc, product, plan } = {}) {
   return CANONICAL_SKUS.includes(mapped) ? mapped : "";
 }
 
-function resolveEffectiveSku(resolvedSku, testTarget) {
-  if (resolvedSku !== "test") {
-    return { effectiveSku: resolvedSku, reason: "" };
-  }
-  const normalizedTarget = applySkuAlias(normalizeSku(testTarget));
-  if (!["vip_30d", "rainbow_30d"].includes(normalizedTarget)) {
-    return { effectiveSku: "", reason: "missing_test_target" };
-  }
-  return { effectiveSku: normalizedTarget, reason: "" };
-}
-
 function resolveRconCommands({ effectiveSku, steamid64 }) {
   const templates = RCON_PRODUCT_MAP[effectiveSku] || [];
   const commands = templates.map((command) =>
@@ -61,6 +57,5 @@ export {
   applySkuAlias,
   normalizeSku,
   resolveCanonicalSku,
-  resolveEffectiveSku,
   resolveRconCommands
 };

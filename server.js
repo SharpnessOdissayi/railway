@@ -8,7 +8,6 @@ import { open } from "sqlite";
 import WebSocket from "ws";
 import {
   resolveCanonicalSku,
-  resolveEffectiveSku,
   resolveRconCommands
 } from "./tranzilaProducts.js";
 
@@ -89,16 +88,10 @@ const SKU_MAP = {
     ],
     durationSeconds: 2592000
   },
-  vip_test_10m: {
+  rainbow_10m: {
     type: "permissions",
-    rconGrant: [
-      "oxide.grant user {steamid64} loverustvip.use",
-      "oxide.grant user {steamid64} vipwall.use"
-    ],
-    rconRevoke: [
-      "oxide.revoke user {steamid64} loverustvip.use",
-      "oxide.revoke user {steamid64} vipwall.use"
-    ],
+    rconGrant: ["oxide.grant user {steamid64} loverustvip.rainbow"],
+    rconRevoke: ["oxide.revoke user {steamid64} loverustvip.rainbow"],
     durationSeconds: 600
   },
   rainbow_30d: {
@@ -794,10 +787,7 @@ app.post("/tranzila/notify", async (req, res) => {
       product: rawProduct || product,
       plan: rawPlan || plan
     });
-    const { effectiveSku, reason: testReason } = resolveEffectiveSku(
-      resolvedSku,
-      process.env.TEST_TARGET
-    );
+    const effectiveSku = resolvedSku;
 
     console.log("Body keys:", Object.keys(body || {}));
 
@@ -880,16 +870,6 @@ app.post("/tranzila/notify", async (req, res) => {
 
     if (!resolvedSku) {
       return res.status(200).json({ ok: false, reason: "unknown_product" });
-    }
-
-    if (testReason) {
-      if (testReason === "missing_test_target") {
-        console.error(
-          "TEST_TARGET missing/invalid:",
-          truncateLog(process.env.TEST_TARGET || "(empty)")
-        );
-      }
-      return res.status(200).json({ ok: false, reason: testReason });
     }
 
     const { commands } = resolveRconCommands({
