@@ -34,9 +34,6 @@ const {
   // Database
   DB_PATH,
 
-  // Discord
-  DISCORD_WEBHOOK_URL, // recommended
-
   // Behavior
   DRY_RUN = "false",
   TRAZNILA_NOTIFY_SECRET,
@@ -52,7 +49,13 @@ function required(name, value) {
 required("API_SECRET", API_SECRET);
 const isDryRun = DRY_RUN.toLowerCase() === "true";
 const isRconConfigured = !!(RCON_HOST && RCON_PORT && RCON_PASSWORD);
-const hasDiscordWebhook = !!DISCORD_WEBHOOK_URL;
+const DISCORD_WEBHOOK_KEYS = [
+  "DISCORD_WEBHOOK_URL",
+  "DISCORD_WEBHOOK",
+  "WEBHOOK_URL"
+];
+const discordWebhookConfig = resolveDiscordWebhook(process.env, DISCORD_WEBHOOK_KEYS);
+const hasDiscordWebhook = !!discordWebhookConfig.url;
 
 if (!isRconConfigured) {
   console.warn(
@@ -61,7 +64,7 @@ if (!isRconConfigured) {
 }
 if (!hasDiscordWebhook) {
   console.warn(
-    "Discord webhook is not configured (DISCORD_WEBHOOK_URL missing). Notifications will be skipped."
+    "Discord webhook is not configured (DISCORD_WEBHOOK_URL, DISCORD_WEBHOOK, or WEBHOOK_URL missing). Notifications will be skipped."
   );
 }
 
@@ -188,19 +191,54 @@ const dbPromise = initDb().catch((err) => {
   process.exit(1);
 });
 
-async function discordNotify(content) {
-  if (!DISCORD_WEBHOOK_URL) return;
+function resolveDiscordWebhook(env, keys) {
+  for (const key of keys) {
+    const value = env[key];
+    if (value && String(value).trim() !== "") {
+      return { url: String(value).trim(), keyName: key };
+    }
+  }
+  return { url: "", keyName: "" };
+}
+
+function logDiscordWebhookConfigured() {
+  console.log(
+    `Discord webhook configured: ${hasDiscordWebhook} (env key used: ${
+      discordWebhookConfig.keyName || "none"
+    })`
+  );
+}
+
+async function discordNotify({ content, txnId, steamid64, product, amount } = {}) {
+  if (!discordWebhookConfig.url) return;
 
   try {
-    const res = await fetch(DISCORD_WEBHOOK_URL, {
+    console.log(
+      "Discord webhook sending:",
+      `txnId=${truncateLog(txnId) || "(empty)"}`,
+      `steamid64=${truncateLog(steamid64) || "(empty)"}`,
+      `product=${truncateLog(product) || "(empty)"}`,
+      `amount=${truncateLog(amount) || "(empty)"}`
+    );
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(discordWebhookConfig.url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content })
-    });
+      body: JSON.stringify({ content }),
+      signal: controller.signal
+    }).finally(() => clearTimeout(timeout));
 
+    console.log(
+      "Discord webhook response:",
+      `${res.status} ${res.statusText}`.trim()
+    );
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      console.warn("Discord webhook failed:", res.status, text);
+      const snippet = text.slice(0, 200);
+      if (snippet) {
+        console.warn("Discord webhook non-2xx body:", snippet);
+      }
     }
   } catch (err) {
     console.warn("Discord webhook error:", err?.message || err);
@@ -341,11 +379,29 @@ const processedTxIdsPromise = loadProcessedTxIds();
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+app.get("/debug/test-discord", async (req, res) => {
+  const token = pickFirst(req.query, ["token"]);
+  if (!TRAZNILA_NOTIFY_SECRET || token !== TRAZNILA_NOTIFY_SECRET) {
+    return res.status(401).json({ ok: false, reason: "unauthorized" });
+  }
+
+  logDiscordWebhookConfigured();
+  await discordNotify({
+    content: "🧪 Discord webhook test message (LoveRust Pay Bridge).",
+    txnId: "test",
+    steamid64: "test",
+    product: "test",
+    amount: "test"
+  });
+
+  return res.status(200).json({ ok: true, sent: hasDiscordWebhook });
+});
 
 app.post("/tranzila/notify", async (req, res) => {
   console.log("=== TRANZILA NOTIFY HIT ===");
   console.log("Content-Type:", req.headers["content-type"] || "(none)");
   console.log("Query keys:", Object.keys(req.query || {}));
+  logDiscordWebhookConfigured();
   try {
     const normalized = normalizeNotifyFields(req);
     const {
@@ -463,6 +519,13 @@ app.post("/tranzila/notify", async (req, res) => {
 
       processedTxIds.add(txnId);
       await persistProcessedTxIds(processedTxIds);
+      await discordNotify({
+        content: `✅ VIP granted\nSteamID: ${steamid64}\nProduct: ${normalizedProduct}\nAmount: ${amount || "(unknown)"}\nTxn: ${txnId}`,
+        txnId,
+        steamid64,
+        product: normalizedProduct,
+        amount
+      });
 
       return res.status(200).json({
         ok: true,
@@ -550,9 +613,12 @@ async function processExpiredEntitlements() {
       console.log(`RCON revoke command: ${row.revokeCommand}`);
       await rconSend(row.revokeCommand);
       await db.run("UPDATE entitlements SET revokedAt = ? WHERE id = ?", new Date().toISOString(), row.id);
-      await discordNotify(
-        `🕒 Entitlement revoked\nSteamID: ${row.steamid64}\nSKU: ${row.sku}\nTxn: ${row.txnId}`
-      );
+      await discordNotify({
+        content: `🕒 Entitlement revoked\nSteamID: ${row.steamid64}\nSKU: ${row.sku}\nTxn: ${row.txnId}`,
+        txnId: row.txnId,
+        steamid64: row.steamid64,
+        product: row.sku
+      });
     } catch (err) {
       console.warn(
         `Failed to revoke entitlement ${row.id}:`,
