@@ -16,6 +16,7 @@ This service receives Tranzila notify calls and grants VIP via Rust RCON. It sup
 | `DISCORD_WEBHOOK` | no | Alias for `DISCORD_WEBHOOK_URL`. |
 | `WEBHOOK_URL` | no | Alias for `DISCORD_WEBHOOK_URL`. |
 | `DRY_RUN` | no | If `true`, RCON commands are logged instead of executed. |
+| `VOLUME_PATH` | no | Persistent volume directory for `peak.json` (defaults to `/data` if present). |
 | `PORT` | no | HTTP port (defaults to `8080`). |
 
 Processed Tranzila transaction IDs are stored in `./data/processed.json` to prevent double grants.
@@ -151,7 +152,9 @@ Example response:
 ```
 
 Notes:
-- `dayKey` is computed in UTC (`YYYY-MM-DD`).
+- Day boundaries are computed in `Asia/Jerusalem` with a start time of `05:00` local time.
+- `peakToday` is floored to `10` for display (internal tracking still uses the real peak).
+- To persist peak across deploys, mount a volume and set `VOLUME_PATH=/data` (or rely on auto-detection of `/data`).
 - `peakToday` only updates on fresh RCON status fetches (not cached responses).
 
 Manual test:
