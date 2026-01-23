@@ -6,6 +6,7 @@ import path from "node:path";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import WebSocket from "ws";
+import { resolveRconCommands } from "./tranzilaProducts.js";
 
 console.log("BOOT: LoveRustPayBridge v2026-01-22-RCON-OPTIONAL");
 
@@ -254,12 +255,29 @@ function pickFirst(obj, keys) {
   return "";
 }
 
+function pickFirstWithKey(obj, keys) {
+  for (const k of keys) {
+    if (obj && obj[k] !== undefined && obj[k] !== null && String(obj[k]).trim() !== "") {
+      return { value: String(obj[k]).trim(), key: k };
+    }
+  }
+  return { value: "", key: "" };
+}
+
 function pickFirstFromSources(sources, keys) {
   for (const source of sources) {
     const value = pickFirst(source, keys);
     if (value) return value;
   }
   return "";
+}
+
+function pickFirstFromSourcesWithKey(sources, keys) {
+  for (const source of sources) {
+    const result = pickFirstWithKey(source, keys);
+    if (result.value) return result;
+  }
+  return { value: "", key: "" };
 }
 
 function truncateLog(value, maxLength = 80) {
@@ -305,7 +323,7 @@ function normalizeNotifyFields(req) {
   const amount = pickFirstFromSources(sources, ["sum", "amount", "total"]);
   const status = pickFirstFromSources(sources, ["status", "Response", "response"]);
   const responseCode = pickFirstFromSources(sources, ["Response", "response"]);
-  const txnId = pickFirstFromSources(sources, [
+  const txnIdResult = pickFirstFromSourcesWithKey(sources, [
     "tx",
     "txnId",
     "transaction_id",
@@ -326,13 +344,23 @@ function normalizeNotifyFields(req) {
     amount,
     status,
     responseCode,
-    txnId
+    txnId: txnIdResult.value,
+    txnIdSource: txnIdResult.key
   };
 }
 
-function normalizeProduct(product) {
-  if (!product) return "";
-  return String(product).trim().toLowerCase().replace(/-/g, "_");
+const SENSITIVE_LOG_KEYS = new Set([
+  "ccno",
+  "expmonth",
+  "expyear",
+  "confirmationcode",
+  "cardtype",
+  "cvv",
+  "cvc"
+]);
+
+function isSensitiveLogKey(key) {
+  return key ? SENSITIVE_LOG_KEYS.has(String(key).toLowerCase()) : false;
 }
 
 function isApprovedStatus(status, responseCode) {
@@ -756,9 +784,11 @@ app.post("/tranzila/notify", async (req, res) => {
       amount,
       status,
       responseCode,
-      txnId
+      txnId,
+      txnIdSource
     } = normalized;
-    const normalizedProduct = normalizeProduct(product);
+    const logTxnId = isSensitiveLogKey(txnIdSource) ? "(redacted)" : truncateLog(txnId);
+    const { resolvedProduct, templates: commands } = resolveRconCommands(product, steamid64);
 
     console.log("Body keys:", Object.keys(body || {}));
 
@@ -767,14 +797,14 @@ app.post("/tranzila/notify", async (req, res) => {
       `steamid64=${truncateLog(steamid64) || "(empty)"}`,
       `product=${truncateLog(product) || "(empty)"}`,
       `status=${truncateLog(status) || "(empty)"}`,
-      `txn_id=${truncateLog(txnId) || "(empty)"}`
+      `txn_id=${logTxnId || "(empty)"}`
     );
     console.log("Notify normalized:", {
       steamid64: truncateLog(steamid64),
       product: truncateLog(product),
-      normalizedProduct: truncateLog(normalizedProduct),
+      resolvedProduct: truncateLog(resolvedProduct),
       status: truncateLog(status),
-      txnId: truncateLog(txnId),
+      txnId: logTxnId,
       amount: truncateLog(amount),
       responseCode: truncateLog(responseCode)
     });
@@ -823,28 +853,27 @@ app.post("/tranzila/notify", async (req, res) => {
 
     const processedTxIds = await processedTxIdsPromise;
     if (processedTxIds.has(txnId)) {
-      console.log(`Duplicate txnId ignored: ${txnId}`);
+      console.log(`Duplicate txnId ignored: ${logTxnId}`);
       return res.status(200).json({
         ok: true,
         txId: txnId,
         steamid64,
-        product: normalizedProduct || product,
+        product: resolvedProduct || product,
         actions: [],
         duplicate: true
       });
     }
 
-    if (!normalizedProduct) {
+    if (!resolvedProduct) {
       return res.status(400).json({ ok: false, reason: "missing_product" });
     }
 
-    const commands = RCON_PRODUCT_MAP[normalizedProduct] || [];
     if (!commands.length) {
       console.warn("Notify rejected: unknown product", {
         steamid64,
         product,
-        normalizedProduct,
-        txnId
+        resolvedProduct,
+        txnId: logTxnId
       });
       return res.status(400).json({ ok: false, reason: "unknown_product" });
     }
@@ -856,7 +885,7 @@ app.post("/tranzila/notify", async (req, res) => {
       const actions = [];
       for (const command of commands) {
         const resolvedCommand = command.replace("{steamid64}", steamid64);
-        console.log(`RCON command: ${resolvedCommand}`);
+        console.log(`resolvedProduct=${resolvedProduct} command=${resolvedCommand}`);
         const result = await rconSend(resolvedCommand, { timeoutMs: 4000 });
         console.log("RCON result:", result);
         actions.push({ command: resolvedCommand, result });
@@ -865,10 +894,10 @@ app.post("/tranzila/notify", async (req, res) => {
       processedTxIds.add(txnId);
       await persistProcessedTxIds(processedTxIds);
       await discordNotify({
-        content: `✅ VIP granted\nSteamID: ${steamid64}\nProduct: ${normalizedProduct}\nAmount: ${amount || "(unknown)"}\nTxn: ${txnId}`,
+        content: `✅ VIP granted\nSteamID: ${steamid64}\nProduct: ${resolvedProduct}\nAmount: ${amount || "(unknown)"}\nTxn: ${txnId}`,
         txnId,
         steamid64,
-        product: normalizedProduct,
+        product: resolvedProduct,
         amount
       });
 
@@ -876,7 +905,7 @@ app.post("/tranzila/notify", async (req, res) => {
         ok: true,
         txId: txnId,
         steamid64,
-        product: normalizedProduct,
+        product: resolvedProduct,
         actions
       });
     } catch (err) {
