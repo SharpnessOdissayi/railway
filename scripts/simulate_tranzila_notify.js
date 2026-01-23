@@ -2,7 +2,7 @@ import { resolveRconCommands } from "../tranzilaProducts.js";
 
 const steamid64 = "76561199026505924";
 const formBody = new URLSearchParams({
-  product: "vip-rainbow",
+  product: "rainbow",
   steamid64,
   status: "approved",
   tx: "test_tx"
@@ -11,12 +11,14 @@ const formBody = new URLSearchParams({
 const parsed = Object.fromEntries(new URLSearchParams(formBody).entries());
 const { resolvedProduct, commands } = resolveRconCommands(parsed.product, steamid64);
 const expected = `loverustvip.grantrainbow ${steamid64} 30d`;
+const forbidden = `loverustvip.grant ${steamid64} 30d`;
 
-if (!commands.includes(expected)) {
-  console.error("Expected command not found.", {
+if (!commands.includes(expected) || commands.includes(forbidden)) {
+  console.error("Unexpected command mapping.", {
     resolvedProduct,
     commands,
-    expected
+    expected,
+    forbidden
   });
   process.exit(1);
 }
