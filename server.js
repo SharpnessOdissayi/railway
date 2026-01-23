@@ -372,6 +372,17 @@ function isApprovedStatus(status, responseCode) {
   });
 }
 
+const RCON_PRODUCT_MAP = {
+  test_vip: [
+    "loverustvip.grantrainbow {steamid64} 10m"
+  ],
+  vip_30: ["loverustvip.grant {steamid64} 30d"],
+  rainbow_30: [
+    "loverustvip.grant {steamid64} 30d",
+    "oxide.grant user {steamid64} vip.rainbow"
+  ]
+};
+
 async function loadProcessedTxIds() {
   try {
     const content = await fs.readFile(PROCESSED_TX_PATH, "utf8");
