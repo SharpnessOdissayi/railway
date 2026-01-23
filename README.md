@@ -136,7 +136,30 @@ Invoke-RestMethod -Method Post `
 
 Returns the live Rust player count from RCON (cached for ~10 seconds).
 
+Example response:
+```json
+{
+  "ok": true,
+  "online": 42,
+  "max": 200,
+  "peakToday": 87,
+  "peakTodayUpdatedAt": "2026-01-22T10:15:30.123Z",
+  "dayKey": "2026-01-22",
+  "updatedAt": "2026-01-22T10:15:30.123Z",
+  "raw": "players : 42/200 (200 max)"
+}
+```
+
+Notes:
+- `dayKey` is computed in UTC (`YYYY-MM-DD`).
+- `peakToday` only updates on fresh RCON status fetches (not cached responses).
+
 Manual test:
 ```bash
 curl https://<railway-domain>/server/status
+```
+
+Example curl test:
+```bash
+curl http://localhost:8080/server/status | jq
 ```
