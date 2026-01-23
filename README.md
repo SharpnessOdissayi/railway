@@ -12,11 +12,31 @@ This service receives Tranzila notify calls and grants VIP via Rust RCON. It sup
 | `RCON_PORT` | yes | Rust RCON port. |
 | `RCON_PASSWORD` | yes | Rust RCON password. |
 | `DB_PATH` | no | SQLite path (defaults to `./data.sqlite`). |
-| `DISCORD_WEBHOOK_URL` | no | Discord webhook for notifications. |
+| `DISCORD_WEBHOOK_URL` | no | Discord webhook for notifications (preferred). |
+| `DISCORD_WEBHOOK` | no | Alias for `DISCORD_WEBHOOK_URL`. |
+| `WEBHOOK_URL` | no | Alias for `DISCORD_WEBHOOK_URL`. |
 | `DRY_RUN` | no | If `true`, RCON commands are logged instead of executed. |
 | `PORT` | no | HTTP port (defaults to `8080`). |
 
 Processed Tranzila transaction IDs are stored in `./data/processed.json` to prevent double grants.
+
+## Discord Webhook
+
+The service can send Discord notifications after a successful Tranzila notify + VIP grant. Configure **one** of the following environment variables (first non-empty wins):
+
+- `DISCORD_WEBHOOK_URL` (preferred)
+- `DISCORD_WEBHOOK`
+- `WEBHOOK_URL`
+
+### Debug test endpoint
+
+You can trigger a test webhook message with:
+
+```
+GET /debug/test-discord?token=YOUR_SECRET
+```
+
+The `token` must match the same `TRAZNILA_NOTIFY_SECRET` used for `/tranzila/notify`.
 
 ## Tranzila notify endpoint
 
