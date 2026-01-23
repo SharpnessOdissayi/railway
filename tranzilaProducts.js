@@ -6,15 +6,24 @@ const SKU_ALIASES = {
   rainbow10m: "rainbow_10m"
 };
 
-const SKU_ALIASES = {
-  vip30d: "vip_30d",
-  rainbow30d: "rainbow_30d"
-};
-
 const RCON_PRODUCT_MAP = {
   vip_30d: ["loverustvip.grant {steamid64} 30d"],
-  rainbow_30d: ["loverustvip.grantrainbow {steamid64} 30d"],
-  rainbow_10m: ["loverustvip.grantrainbow {steamid64} 10m"]
+  rainbow_30d: [
+    "loverustvip.grant {steamid64} 30d",
+    "loverustvip.setcolor {steamid64} rainbow"
+  ],
+  rainbow_10m: [
+    "loverustvip.grant {steamid64} 10m",
+    "loverustvip.setcolor {steamid64} rainbow"
+  ]
+};
+
+const DURATION_CAPS = {
+  m: 43200,
+  h: 720,
+  d: 30,
+  w: 4,
+  mo: 1
 };
 
 function normalizeSku(value) {
@@ -43,7 +52,83 @@ function resolveCanonicalSku({ custom2, pdesc, product, plan } = {}) {
   return CANONICAL_SKUS.includes(mapped) ? mapped : "";
 }
 
-function resolveRconCommands({ effectiveSku, steamid64 }) {
+function clampDurationValue(unit, value) {
+  const cap = DURATION_CAPS[unit];
+  if (!cap) return value;
+  return Math.min(value, cap);
+}
+
+function parseSkuToGrant(skuCandidate) {
+  const normalized = normalizeSku(skuCandidate);
+  if (!normalized) {
+    return { result: null, normalized, reason: "empty_sku" };
+  }
+
+  const match = normalized.match(/^(vip|rainbow)(?:_(.+))?$/);
+  if (!match) {
+    return { result: null, normalized, reason: "unsupported_product" };
+  }
+
+  const kind = match[1];
+  const remainder = match[2];
+  let duration = "";
+
+  if (!remainder) {
+    duration = "30d";
+  } else if (["perm", "permanent"].includes(remainder)) {
+    duration = "perm";
+  } else {
+    let durationMatch = remainder.match(/^(\d+)(mo|m|h|d|w)$/);
+    if (!durationMatch && /^\d+$/.test(remainder)) {
+      durationMatch = [remainder, remainder, "d"];
+    }
+
+    if (!durationMatch) {
+      return { result: null, normalized, reason: "invalid_duration" };
+    }
+
+    const value = Number.parseInt(durationMatch[1], 10);
+    if (!Number.isFinite(value) || value <= 0) {
+      return { result: null, normalized, reason: "non_positive_duration" };
+    }
+
+    const unit = durationMatch[2];
+    const clampedValue = clampDurationValue(unit, value);
+    duration = `${clampedValue}${unit}`;
+  }
+
+  const effectiveSku = duration === "perm" ? `${kind}_perm` : `${kind}_${duration}`;
+
+  return {
+    result: {
+      kind,
+      duration,
+      effectiveSku
+    },
+    normalized,
+    reason: ""
+  };
+}
+
+function buildGrantCommands({ steamid64, kind, duration }) {
+  if (!steamid64 || !kind || !duration) return [];
+  const baseGrant = `loverustvip.grant ${steamid64} ${duration}`;
+  if (kind === "rainbow") {
+    return [baseGrant, `loverustvip.setcolor ${steamid64} rainbow`];
+  }
+  return [baseGrant];
+}
+
+function resolveRconCommands({ effectiveSku, steamid64, grant } = {}) {
+  if (grant?.kind && grant?.duration) {
+    const commands = buildGrantCommands({
+      steamid64,
+      kind: grant.kind,
+      duration: grant.duration
+    });
+    return { templates: commands, commands };
+  }
+
   const templates = RCON_PRODUCT_MAP[effectiveSku] || [];
   const commands = templates.map((command) =>
     command.replace("{steamid64}", steamid64)
@@ -55,7 +140,9 @@ export {
   CANONICAL_SKUS,
   RCON_PRODUCT_MAP,
   applySkuAlias,
+  buildGrantCommands,
   normalizeSku,
+  parseSkuToGrant,
   resolveCanonicalSku,
   resolveRconCommands
 };
