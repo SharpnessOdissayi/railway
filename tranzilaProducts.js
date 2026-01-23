@@ -1,21 +1,13 @@
-const PRODUCT_ALIASES = {
-  vip_rainbow: "vip_rainbow",
-  "vip-rainbow": "vip_rainbow",
-  rainbow: "rainbow_30",
-  "cosmetic-rainbow": "rainbow_30",
-  "cosmetic_rainbow": "rainbow_30"
-};
+const CANONICAL_SKUS = ["vip_30d", "rainbow_30d", "test"];
 
 const RCON_PRODUCT_MAP = {
-  test_vip: ["loverustvip.grant {steamid64} 10m"],
-  vip_rainbow: ["loverustvip.grantrainbow {steamid64} 30d"],
-  vip_30: ["loverustvip.grant {steamid64} 30d"],
-  rainbow_30: ["loverustvip.grantrainbow {steamid64} 30d"]
+  vip_30d: ["loverustvip.grant {steamid64} 30d"],
+  rainbow_30d: ["loverustvip.grantrainbow {steamid64} 30d"]
 };
 
-function normalizeProduct(product) {
-  if (!product) return "";
-  return String(product)
+function normalizeSku(value) {
+  if (!value) return "";
+  return String(value)
     .trim()
     .toLowerCase()
     .replace(/[\s-]+/g, "_")
@@ -23,25 +15,40 @@ function normalizeProduct(product) {
     .replace(/^_+|_+$/g, "");
 }
 
-function resolveProduct(product) {
-  const normalized = normalizeProduct(product);
+function resolveCanonicalSku({ custom2, pdesc, product } = {}) {
+  const normalized = [
+    normalizeSku(custom2),
+    normalizeSku(pdesc),
+    normalizeSku(product)
+  ].find(Boolean);
   if (!normalized) return "";
-  return PRODUCT_ALIASES[normalized] || normalized;
+  return CANONICAL_SKUS.includes(normalized) ? normalized : "";
 }
 
-function resolveRconCommands(product, steamid64) {
-  const resolvedProduct = resolveProduct(product);
-  const templates = RCON_PRODUCT_MAP[resolvedProduct] || [];
+function resolveEffectiveSku(resolvedSku, testTarget) {
+  if (resolvedSku !== "test") {
+    return { effectiveSku: resolvedSku, reason: "" };
+  }
+  const normalizedTarget = normalizeSku(testTarget);
+  if (!["vip_30d", "rainbow_30d"].includes(normalizedTarget)) {
+    return { effectiveSku: "", reason: "test_target_required" };
+  }
+  return { effectiveSku: normalizedTarget, reason: "" };
+}
+
+function resolveRconCommands({ effectiveSku, steamid64 }) {
+  const templates = RCON_PRODUCT_MAP[effectiveSku] || [];
   const commands = templates.map((command) =>
     command.replace("{steamid64}", steamid64)
   );
-  return { resolvedProduct, templates, commands };
+  return { templates, commands };
 }
 
 export {
-  PRODUCT_ALIASES,
+  CANONICAL_SKUS,
   RCON_PRODUCT_MAP,
-  normalizeProduct,
-  resolveProduct,
+  normalizeSku,
+  resolveCanonicalSku,
+  resolveEffectiveSku,
   resolveRconCommands
 };

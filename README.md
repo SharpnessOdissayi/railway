@@ -16,10 +16,11 @@ This service receives Tranzila notify calls and grants VIP via Rust RCON. It sup
 | `DISCORD_WEBHOOK` | no | Alias for `DISCORD_WEBHOOK_URL`. |
 | `WEBHOOK_URL` | no | Alias for `DISCORD_WEBHOOK_URL`. |
 | `DRY_RUN` | no | If `true`, RCON commands are logged instead of executed. |
+| `TEST_TARGET` | no | For `sku=test`, route to `vip_30d` or `rainbow_30d` (required for test grants). |
 | `VOLUME_PATH` | no | Persistent volume directory for `peak.json` (defaults to `/data` if present). |
 | `PORT` | no | HTTP port (defaults to `8080`). |
 
-Processed Tranzila transaction IDs are stored in `./data/processed.json` to prevent double grants.
+Processed Tranzila transaction IDs are tracked in-memory for 24 hours to prevent double grants.
 
 ## Discord Webhook
 
@@ -49,15 +50,15 @@ Supported content types:
 
 Field normalization:
 - `steamid64`: `steamid64`, `contact`, `steam_id`, `steamId`, `custom1`
-- `product`: `product`, `sku`, `pdesc`, `plan`, `description`
+- `product` priority: `custom2`, then `pdesc`, then `product`/`sku`
 - `amount`: `sum`, `amount`, `total`
 - `status/approval`: `Response` (`000` approved) or `status` (`approved`, `ok`, `success`, or `0/00/000`)
-- `txId`: `tx`, `txnId`, `transaction_id`, `tranId`, `transId`, `ConfirmationCode`, `index`, `orderid`, `orderId`, `id`, `Tempref`
+- `txId`: `ConfirmationCode`, `Tempref`, `txnId`, `transaction_id`, `tranId`, `transId`, `tx`, `index`, `orderid`, `orderId`, `id`
 
 Product mapping:
-- `test-vip` / `test_vip` → `loverustvip.grant <steamid64> 10m`
-- `vip_30` → `loverustvip.grant <steamid64> 30d`
-- `rainbow_30` → `loverustvip.grant <steamid64> 30d` + `oxide.grant user <steamid64> vip.rainbow`
+- `vip_30d` → `loverustvip.grant <steamid64> 30d`
+- `rainbow_30d` → `loverustvip.grantrainbow <steamid64> 30d`
+- `test` → `TEST_TARGET` (must be `vip_30d` or `rainbow_30d`)
 
 ### Tranzila settings
 
@@ -69,9 +70,13 @@ https://<your-domain>/tranzila/notify
 Ensure Tranzila sends:
 - `Response=000`
 - `contact=<steamid64>`
-- `sku=test-vip`
+- `custom2=vip_30d` (or `custom2=rainbow_30d`)
 - `sum=0.01`
 - `ConfirmationCode` or `index` (used as `txId`)
+
+### Railway env var
+
+Set `TEST_TARGET` in Railway to `vip_30d` or `rainbow_30d` to control how `sku=test` is routed.
 
 ## Local test commands
 
@@ -82,7 +87,7 @@ curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
   -d '{
     "Response": "000",
     "contact": "76561198000000000",
-    "sku": "test-vip",
+    "custom2": "vip_30d",
     "sum": "0.01",
     "ConfirmationCode": "tx-123"
   }'
@@ -94,7 +99,7 @@ curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   --data-urlencode "Response=000" \
   --data-urlencode "contact=76561198000000000" \
-  --data-urlencode "sku=test_vip" \
+  --data-urlencode "custom2=rainbow_30d" \
   --data-urlencode "sum=0.01" \
   --data-urlencode "index=tx-456"
 ```
@@ -104,7 +109,7 @@ curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
 $body = @{
   Response = "000"
   contact = "76561198000000000"
-  sku = "test-vip"
+  custom2 = "vip_30d"
   sum = "0.01"
   ConfirmationCode = "tx-789"
 } | ConvertTo-Json
@@ -120,7 +125,7 @@ Invoke-RestMethod -Method Post `
 $form = @{
   Response = "000"
   contact = "76561198000000000"
-  sku = "vip_30"
+  custom2 = "vip_30d"
   sum = "1.00"
   index = "tx-987"
 }
@@ -129,6 +134,57 @@ Invoke-RestMethod -Method Post `
   -Uri "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" `
   -ContentType "application/x-www-form-urlencoded" `
   -Body $form
+```
+
+## Acceptance tests (curl)
+
+### Rainbow 30d only
+```bash
+curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "Response": "000",
+    "contact": "76561198000000000",
+    "custom2": "rainbow_30d",
+    "ConfirmationCode": "tx-rainbow-1"
+  }'
+```
+
+### VIP 30d only
+```bash
+curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "Response": "000",
+    "contact": "76561198000000000",
+    "custom2": "vip_30d",
+    "ConfirmationCode": "tx-vip-1"
+  }'
+```
+
+### TEST_TARGET routed to rainbow
+```bash
+TEST_TARGET=rainbow_30d \
+curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "Response": "000",
+    "contact": "76561198000000000",
+    "custom2": "test",
+    "ConfirmationCode": "tx-test-1"
+  }'
+```
+
+### Deduped transaction
+```bash
+curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "Response": "000",
+    "contact": "76561198000000000",
+    "custom2": "vip_30d",
+    "ConfirmationCode": "tx-vip-1"
+  }'
 ```
 
 ## Server status endpoint
