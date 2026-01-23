@@ -1,19 +1,16 @@
-const CANONICAL_SKUS = ["vip_30d", "rainbow_30d", "rainbow_10m"];
+const CANONICAL_SKUS = ["vip_30d", "rainbow_30d"];
 
 const SKU_ALIASES = {
   vip30d: "vip_30d",
   rainbow30d: "rainbow_30d",
-  rainbow10m: "rainbow_10m"
+  rainbow10m: "rainbow_30d",
+  rainbow_10m: "rainbow_30d"
 };
 
 const RCON_PRODUCT_MAP = {
   vip_30d: ["loverustvip.grant {steamid64} 30d"],
   rainbow_30d: [
     "loverustvip.grant {steamid64} 30d",
-    "loverustvip.setcolor {steamid64} rainbow"
-  ],
-  rainbow_10m: [
-    "loverustvip.grant {steamid64} 10m",
     "loverustvip.setcolor {steamid64} rainbow"
   ]
 };

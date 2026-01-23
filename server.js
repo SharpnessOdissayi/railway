@@ -284,6 +284,13 @@ function truncateLog(value, maxLength = 80) {
   return `${text.slice(0, maxLength)}...`;
 }
 
+function normalizeAmount(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const numeric = Number.parseFloat(String(value).replace(/,/g, "").trim());
+  if (!Number.isFinite(numeric)) return null;
+  return Number.parseFloat(numeric.toFixed(2));
+}
+
 function coerceBody(req) {
   if (typeof req.body === "string") {
     const trimmed = req.body.trim();
@@ -376,6 +383,10 @@ function isApprovedStatus(status, responseCode) {
 
 function isIdempotentSource(_req) {
   return true;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const processedTxCache = new Map();
@@ -800,17 +811,31 @@ app.post("/tranzila/notify", async (req, res) => {
     const skuCandidate =
       pickFirst(
         {
+          resolvedSku,
           custom2: rawCustom2 || custom2,
           pdesc: rawPdesc || pdesc,
-          resolvedSku,
           product: rawProduct || product,
           plan: rawPlan || plan
         },
-        ["custom2", "pdesc", "resolvedSku", "product", "plan"]
+        ["resolvedSku", "custom2", "pdesc", "product", "plan"]
       ) || "";
     const parsedGrant = parseSkuToGrant(skuCandidate);
-    const grant = parsedGrant.result;
-    const effectiveSku = grant?.effectiveSku || resolvedSku;
+    let grant = parsedGrant.result;
+    let effectiveSku = grant?.effectiveSku || resolvedSku;
+    const amountValue = normalizeAmount(amount);
+    const rainbowCandidateValues = [grant?.kind, resolvedSku, skuCandidate].filter(Boolean);
+    const isRainbowCandidate = rainbowCandidateValues.some((value) =>
+      String(value).toLowerCase().includes("rainbow")
+    );
+    const forceRainbow30d = amountValue === 0.01 && isRainbowCandidate;
+    if (forceRainbow30d) {
+      grant = {
+        kind: "rainbow",
+        duration: "30d",
+        effectiveSku: "rainbow_30d"
+      };
+      effectiveSku = "rainbow_30d";
+    }
     const normalizedProduct = grant?.kind || "";
     const normalizedDuration = grant?.duration || "";
     if (grant) {
@@ -961,11 +986,24 @@ app.post("/tranzila/notify", async (req, res) => {
         grantLogParts.push(`cmd2=${commands[1]}`);
       }
       console.log(`[GRANT] ${grantLogParts.join(" ")}`);
-      for (const command of commands) {
+      for (const [index, command] of commands.entries()) {
+        if (index > 0) {
+          await delay(300);
+        }
         console.log(`resolvedSku=${resolvedSku} command=${command}`);
-        const result = await rconSend(command, { timeoutMs: 4000 });
-        console.log("RCON result:", result);
-        actions.push({ command, result });
+        try {
+          const timeoutMs = index === 0 ? 4000 : 10000;
+          const result = await rconSend(command, { timeoutMs });
+          console.log("RCON result:", result);
+          actions.push({ command, result });
+        } catch (err) {
+          const errorMessage = err?.message || err;
+          actions.push({ command, ok: false, error: errorMessage });
+          if (index === 0) {
+            throw err;
+          }
+          console.warn("RCON non-critical command failed:", errorMessage);
+        }
       }
       console.log("RCON commands executed", {
         count: commands.length,
