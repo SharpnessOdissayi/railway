@@ -345,7 +345,9 @@ function isApprovedStatus(status, responseCode) {
 }
 
 const RCON_PRODUCT_MAP = {
-  test_vip: ["loverustvip.grant {steamid64} 10m"],
+  test_vip: [
+    "loverustvip.grantrainbow {steamid64} 10m"
+  ],
   vip_30: ["loverustvip.grant {steamid64} 30d"],
   rainbow_30: [
     "loverustvip.grant {steamid64} 30d",
