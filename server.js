@@ -378,10 +378,16 @@ async function persistProcessedTxIds(txIds) {
 const processedTxIdsPromise = loadProcessedTxIds();
 const STATUS_CACHE_TTL_MS = 10 * 1000;
 const STATUS_RAW_MAX = 600;
+const STATUS_DAY_KEY_TIMEZONE = "UTC";
 const statusCache = {
   value: null,
   expiresAt: 0,
   inflight: null
+};
+const statusPeak = {
+  dayKey: new Date().toISOString().slice(0, 10),
+  peakToday: null,
+  peakTodayUpdatedAt: null
 };
 
 function readStatusCache() {
@@ -407,11 +413,40 @@ function formatStatusPayload({ ok, online, max, raw, error }) {
     ok: Boolean(ok),
     online: Number.isFinite(online) ? online : null,
     max: Number.isFinite(max) ? max : null,
+    peakToday: Number.isFinite(statusPeak.peakToday) ? statusPeak.peakToday : null,
+    peakTodayUpdatedAt: statusPeak.peakTodayUpdatedAt,
+    dayKey: statusPeak.dayKey,
     updatedAt: new Date().toISOString()
   };
   if (raw) payload.raw = truncateRawStatus(raw);
   if (error) payload.error = error;
   return payload;
+}
+
+function getStatusDayKey(date = new Date()) {
+  if (STATUS_DAY_KEY_TIMEZONE === "UTC") {
+    return date.toISOString().slice(0, 10);
+  }
+  return date.toISOString().slice(0, 10);
+}
+
+function updatePeakToday(online) {
+  const now = new Date();
+  const dayKey = getStatusDayKey(now);
+  const hasPeakToday = Number.isFinite(statusPeak.peakToday);
+
+  if (!hasPeakToday || statusPeak.dayKey !== dayKey) {
+    statusPeak.dayKey = dayKey;
+    statusPeak.peakToday = Number.isFinite(online) ? online : 0;
+    statusPeak.peakTodayUpdatedAt = now.toISOString();
+    return;
+  }
+
+  const currentPeak = Number.isFinite(statusPeak.peakToday) ? statusPeak.peakToday : 0;
+  if (online > currentPeak) {
+    statusPeak.peakToday = online;
+    statusPeak.peakTodayUpdatedAt = now.toISOString();
+  }
 }
 
 function parsePlayerCounts(raw) {
@@ -462,6 +497,7 @@ async function fetchServerStatus() {
     const raw = result?.raw || "";
     const { online, max } = parsePlayerCounts(raw);
     if (Number.isFinite(online) && Number.isFinite(max)) {
+      updatePeakToday(online);
       const payload = formatStatusPayload({ ok: true, online, max, raw });
       writeStatusCache(payload);
       return payload;
