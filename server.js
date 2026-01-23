@@ -57,15 +57,32 @@ if (!hasDiscordWebhook) {
   );
 }
 
-// Map products you send from Tranzila notify
-const PRODUCT_MAP = {
-  vip_30:      { action: "vip",     duration: "30d", priceLabel: "$19.90" },
-  "vip-monthly": { action: "vip",     duration: "30d", priceLabel: "$19.90" },
-  vip_monthly: { action: "vip",     duration: "30d", priceLabel: "$19.90" },
-  vipmonthly:  { action: "vip",     duration: "30d", priceLabel: "$19.90" },
-  rainbow_30:  { action: "rainbow", duration: "30d", priceLabel: "$9.90" },
-  coffee:      { action: "coffee",  duration: "perm", priceLabel: "$5.00" }
+const SKU_ACTIONS = {
+  vip_30d: {
+    label: "VIP (30d)",
+    commands: [
+      "oxide.grant user {steamid64} loverustvip.use",
+      "oxide.grant user {steamid64} vipwall.use"
+    ]
+  },
+  vip_test_10m: {
+    label: "VIP (10m test)",
+    commands: [
+      "oxide.grant user {steamid64} loverustvip.use",
+      "oxide.grant user {steamid64} vipwall.use"
+    ]
+  },
+  rainbow_30d: {
+    label: "Rainbow (30d)",
+    commands: ["oxide.grant user {steamid64} loverustvip.rainbow"]
+  },
+  coffee_support: {
+    label: "Coffee Support",
+    commands: []
+  }
 };
+
+const processedTxnIds = new Set();
 
 // Rust RCON uses WebSocket: ws://HOST:PORT/PASSWORD
 async function rconSend(command) {
@@ -175,14 +192,7 @@ function normalizeNotifyFields(req) {
     "contact",
     "customer_id"
   ]);
-  const product = pickFirstFromSources(sources, [
-    "product",
-    "product_id",
-    "item",
-    "plan",
-    "description",
-    "product_description"
-  ]);
+  const sku = pickFirstFromSources(sources, ["sku"]);
   const status = pickFirstFromSources(sources, [
     "status",
     "payment_status",
@@ -191,24 +201,18 @@ function normalizeNotifyFields(req) {
     "response",
     "response_code"
   ]);
-  const txnId = pickFirstFromSources(sources, [
-    "txn_id",
-    "transaction_id",
-    "order_id",
-    "index",
-    "confirmation_code"
-  ]);
+  const txnId = pickFirstFromSources(sources, ["txnId", "orderid", "requestId"]);
   const amount = pickFirstFromSources(sources, ["amount", "sum", "price", "total"]);
   const responseCode = pickFirstFromSources(sources, [
+    "responseCode",
     "response_code",
-    "resp_code",
-    "responseCode"
+    "resp_code"
   ]);
 
   return {
     body,
     steamid64,
-    product,
+    sku,
     status,
     txnId,
     amount,
@@ -228,7 +232,7 @@ app.post("/tranzila/notify", async (req, res) => {
     const {
       body,
       steamid64,
-      product,
+      sku,
       status,
       txnId,
       amount,
@@ -240,13 +244,13 @@ app.post("/tranzila/notify", async (req, res) => {
     console.log(
       "Notify summary:",
       `steamid64=${truncateLog(steamid64) || "(empty)"}`,
-      `product=${truncateLog(product) || "(empty)"}`,
+      `sku=${truncateLog(sku) || "(empty)"}`,
       `status=${truncateLog(status) || "(empty)"}`,
       `txn_id=${truncateLog(txnId) || "(empty)"}`
     );
     console.log("Notify normalized:", {
       steamid64: truncateLog(steamid64),
-      product: truncateLog(product),
+      sku: truncateLog(sku),
       status: truncateLog(status),
       txnId: truncateLog(txnId),
       amount: truncateLog(amount),
@@ -264,78 +268,83 @@ app.post("/tranzila/notify", async (req, res) => {
 
     if (!steamid64) return res.status(400).json({ ok: false, error: "missing steamid64" });
 
-    // flexible success detection
-    const s = (status || "").toLowerCase();
+    const normalizedStatus = String(status || "").trim().toLowerCase();
+    const normalizedResponseCode = String(responseCode || "").trim();
     const isSuccess =
-      ["success", "approved", "ok", "true"].includes(s) ||
-      ["000", "0"].includes(String(responseCode || "").toLowerCase());
+      normalizedStatus === "approved" && normalizedResponseCode === "000";
 
     if (!isSuccess) {
       await discordNotify(
-        `❌ Payment not successful\nSteamID: ${steamid64}\nStatus: ${status || "(empty)"}\nProduct: ${product || "(unknown)"}\nTxn: ${txnId || "(none)"}`
+        `❌ Payment not successful\nSteamID: ${steamid64}\nStatus: ${status || "(empty)"}\nResponseCode: ${responseCode || "(empty)"}\nSKU: ${sku || "(empty)"}\nTxn: ${txnId || "(none)"}\nResult: NOT GRANTED`
       );
       return res.status(200).json({ ok: true, ignored: true });
     }
 
-    const mapped = PRODUCT_MAP[product];
+    if (!txnId) {
+      console.warn("Missing txnId; skipping fulfillment.");
+      await discordNotify(
+        `⚠️ Payment received but txnId is missing\nSteamID: ${steamid64}\nSKU: ${sku || "(empty)"}\nResult: NOT GRANTED`
+      );
+      return res.status(200).json({ ok: false, error: "missing_txnid" });
+    }
+
+    if (processedTxnIds.has(txnId)) {
+      console.log(`Duplicate txnId received; ignoring. txnId=${txnId}`);
+      return res.status(200).json({ ok: true, duplicate: true });
+    }
+
+    const mapped = SKU_ACTIONS[sku];
     if (!mapped) {
       await discordNotify(
-        `⚠️ Payment received but product is unknown\nSteamID: ${steamid64}\nProduct: ${product || "(empty)"}\nTxn: ${txnId || "(none)"}\nAction: NOT GRANTED`
+        `⚠️ Payment received but SKU is unknown\nSteamID: ${steamid64}\nSKU: ${sku || "(empty)"}\nTxn: ${txnId}\nResult: NOT GRANTED`
       );
       return res.status(200).json({ ok: true, unknown_product: true });
     }
 
-    let rconCommand = "";
-    let humanProduct = product;
+    const commands = mapped.commands.map((command) =>
+      command.replace("{steamid64}", steamid64)
+    );
 
-    if (mapped.action === "vip") {
-      rconCommand = `loverustvip.grant ${steamid64} ${mapped.duration}`;
-      humanProduct = `VIP (${mapped.duration})`;
-    } else if (mapped.action === "rainbow") {
-      // simplest: grant VIP and tell user to use /cc rainbow
-      rconCommand = `loverustvip.grant ${steamid64} ${mapped.duration}`;
-      humanProduct = `Rainbow Name (${mapped.duration})`;
-    } else if (mapped.action === "coffee") {
-      // donation only
-      rconCommand = "";
-      humanProduct = `Coffee (Donation)`;
-    }
-
-    let rconResult = null;
-    if (rconCommand) {
+    const rconResults = [];
+    if (commands.length > 0) {
       if (!isRconConfigured) {
         await discordNotify(
-          `⚠️ Payment received but RCON is not configured\nSteamID: ${steamid64}\nProduct: ${humanProduct}\nTxn: ${txnId || "(none)"}\nAction: NOT GRANTED`
+          `⚠️ Payment received but RCON is not configured\nSteamID: ${steamid64}\nSKU: ${sku}\nTxn: ${txnId}\nResult: NOT GRANTED`
         );
         return res.status(200).json({ ok: true, granted: false, error: "rcon_not_configured" });
       }
       try {
-        rconResult = await rconSend(rconCommand);
+        for (const command of commands) {
+          const result = await rconSend(command);
+          rconResults.push({ command, result });
+        }
       } catch (err) {
         await discordNotify(
-          `❌ RCON failed\nSteamID: ${steamid64}\nProduct: ${humanProduct}\nTxn: ${txnId || "(none)"}\nError: ${err?.message || "unknown"}`
+          `❌ RCON failed\nSteamID: ${steamid64}\nSKU: ${sku}\nTxn: ${txnId}\nError: ${err?.message || "unknown"}\nResult: NOT GRANTED`
         );
         return res.status(502).json({ ok: false, error: "rcon_failed" });
       }
     }
 
+    processedTxnIds.add(txnId);
+
     let msg =
       `✅ **New Purchase**\n` +
       `**Player (SteamID64):** ${steamid64}\n` +
-      `**Product:** ${humanProduct}\n` +
-      (mapped.priceLabel ? `**Price:** ${mapped.priceLabel}\n` : "") +
-      (txnId ? `**Txn:** ${txnId}\n` : "") +
-      (rconCommand ? `**RCON:** \`${rconCommand}\`` : `**RCON:** (none)`);
-
-    if (mapped.action === "rainbow") msg += `\n**Note:** Player can use \`/cc rainbow\` in-game.`;
+      `**SKU:** ${sku}\n` +
+      `**Txn:** ${txnId}\n` +
+      `**Result:** GRANTED\n` +
+      (commands.length > 0
+        ? `**RCON:**\n${commands.map((cmd) => `- \`${cmd}\``).join("\n")}`
+        : `**RCON:** (none)`);
 
     await discordNotify(msg);
 
     return res.status(200).json({
       ok: true,
-      granted: !!rconCommand,
-      product,
-      rcon: !!rconResult
+      granted: commands.length > 0,
+      sku,
+      rcon: rconResults.length > 0
     });
   } catch (err) {
     console.error(err);
