@@ -888,6 +888,9 @@ app.post("/tranzila/notify", async (req, res) => {
       return res.status(502).json({ ok: false, reason: "rcon_not_configured" });
     }
     try {
+      if (isIdempotentSource) {
+        markRecentTxId(txnId, "inflight");
+      }
       const actions = [];
       console.log("Notify grant plan:", {
         resolvedSku,
@@ -920,6 +923,9 @@ app.post("/tranzila/notify", async (req, res) => {
       });
     } catch (err) {
       console.warn("Notify rejected: rcon_failed", err?.message || err);
+      if (isIdempotentSource) {
+        recentTxIds.delete(txnId);
+      }
       return res.status(502).json({ ok: false, reason: "rcon_failed" });
     }
   } catch (err) {
