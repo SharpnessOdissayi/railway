@@ -56,7 +56,7 @@ Field normalization:
 - `txId`: `ConfirmationCode`, `Tempref`, `txnId`, `transaction_id`, `tranId`, `transId`, `tx`, `index`, `orderid`, `orderId`, `id`
 
 Product mapping:
-- `vip_30d` → `loverustvip.grant <steamid64> 30d`
+- `vip_30d` → `oxide.grant user <steamid64> loverustvip.use` + `oxide.grant user <steamid64> vipwall.use`
 - `rainbow_30d` → `loverustvip.grantrainbow <steamid64> 30d`
 - `test` → `TEST_TARGET` (must be `vip_30d` or `rainbow_30d`)
 
@@ -71,7 +71,7 @@ Ensure Tranzila sends:
 - `Response=000`
 - `contact=<steamid64>`
 - `custom2=vip_30d` (or `custom2=rainbow_30d`)
-- `sum=0.01`
+- `sum=19.90` (VIP 30d) or `sum=9.90` (Rainbow 30d)
 - `ConfirmationCode` or `index` (used as `txId`)
 
 ### Railway env var
@@ -88,7 +88,7 @@ curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
     "Response": "000",
     "contact": "76561198000000000",
     "custom2": "vip_30d",
-    "sum": "0.01",
+    "sum": "19.90",
     "ConfirmationCode": "tx-123"
   }'
 ```
@@ -100,7 +100,7 @@ curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
   --data-urlencode "Response=000" \
   --data-urlencode "contact=76561198000000000" \
   --data-urlencode "custom2=rainbow_30d" \
-  --data-urlencode "sum=0.01" \
+  --data-urlencode "sum=9.90" \
   --data-urlencode "index=tx-456"
 ```
 
@@ -110,7 +110,7 @@ $body = @{
   Response = "000"
   contact = "76561198000000000"
   custom2 = "vip_30d"
-  sum = "0.01"
+  sum = "19.90"
   ConfirmationCode = "tx-789"
 } | ConvertTo-Json
 
@@ -126,7 +126,7 @@ $form = @{
   Response = "000"
   contact = "76561198000000000"
   custom2 = "vip_30d"
-  sum = "1.00"
+  sum = "19.90"
   index = "tx-987"
 }
 
