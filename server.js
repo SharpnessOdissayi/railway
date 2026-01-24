@@ -92,10 +92,10 @@ const SKU_MAP = {
   rainbow_30d: {
     type: "permissions",
     rconGrant: [
-      "oxide.grant user {steamid64} vip_rainbow 30d"
+      "loverustvip.grantrainbow {steamid64} 30d"
     ],
     rconRevoke: [
-      "oxide.revoke user {steamid64} vip_rainbow"
+      "loverustvip.revokerainbow {steamid64}"
     ],
     durationSeconds: 2592000
   },
