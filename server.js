@@ -308,13 +308,6 @@ function truncateLog(value, maxLength = 80) {
   return `${text.slice(0, maxLength)}...`;
 }
 
-function normalizeAmount(value) {
-  if (value === null || value === undefined || value === "") return null;
-  const numeric = Number.parseFloat(String(value).replace(/,/g, "").trim());
-  if (!Number.isFinite(numeric)) return null;
-  return Number.parseFloat(numeric.toFixed(2));
-}
-
 function coerceBody(req) {
   if (typeof req.body === "string") {
     const trimmed = req.body.trim();
@@ -851,22 +844,8 @@ app.post("/tranzila/notify", async (req, res) => {
         ["resolvedSku", "custom2", "pdesc", "product", "plan"]
       ) || "";
     const parsedGrant = parseSkuToGrant(skuCandidate);
-    let grant = parsedGrant.result;
-    let effectiveSku = grant?.effectiveSku || resolvedSku;
-    const amountValue = normalizeAmount(amount);
-    const rainbowCandidateValues = [grant?.kind, resolvedSku, skuCandidate].filter(Boolean);
-    const isRainbowCandidate = rainbowCandidateValues.some((value) =>
-      String(value).toLowerCase().includes("rainbow")
-    );
-    const forceRainbow30d = amountValue === 0.01 && isRainbowCandidate;
-    if (forceRainbow30d) {
-      grant = {
-        kind: "rainbow",
-        duration: "30d",
-        effectiveSku: "rainbow_30d"
-      };
-      effectiveSku = "rainbow_30d";
-    }
+    const grant = parsedGrant.result;
+    const effectiveSku = grant?.effectiveSku || resolvedSku;
     const normalizedProduct = grant?.kind || "";
     const normalizedDuration = grant?.duration || "";
     if (grant) {
