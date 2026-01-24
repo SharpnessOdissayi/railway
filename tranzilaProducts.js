@@ -13,9 +13,7 @@ const RCON_PRODUCT_MAP = {
     "oxide.grant user {steamid64} vipwall.use"
   ],
   rainbow_30d: [
-    "oxide.grant user {steamid64} loverustvip.use",
-    "oxide.grant user {steamid64} vipwall.use",
-    "oxide.grant user {steamid64} vip.rainbow 30d"
+    "oxide.grant user {steamid64} vip_rainbow 30d"
   ]
 };
 
@@ -115,9 +113,7 @@ function buildGrantCommands({ steamid64, kind, duration }) {
   if (!steamid64 || !kind || !duration) return [];
   if (kind === "rainbow") {
     return [
-      `oxide.grant user ${steamid64} loverustvip.use`,
-      `oxide.grant user ${steamid64} vipwall.use`,
-      `oxide.grant user ${steamid64} vip.rainbow 30d`
+      `oxide.grant user ${steamid64} vip_rainbow ${duration}`
     ];
   }
   return [
