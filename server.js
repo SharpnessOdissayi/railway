@@ -94,12 +94,12 @@ const SKU_MAP = {
     rconGrant: [
       "oxide.grant user {steamid64} loverustvip.use",
       "oxide.grant user {steamid64} vipwall.use",
-      "oxide.grant user {steamid64} loverustvip.rainbow"
+      "oxide.grant user {steamid64} vip.rainbow 30d"
     ],
     rconRevoke: [
       "oxide.revoke user {steamid64} loverustvip.use",
       "oxide.revoke user {steamid64} vipwall.use",
-      "oxide.revoke user {steamid64} loverustvip.rainbow"
+      "oxide.revoke user {steamid64} vip.rainbow"
     ],
     durationSeconds: 2592000
   },
