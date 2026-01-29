@@ -78,6 +78,23 @@ Ensure Tranzila sends:
 
 Set `TEST_TARGET` in Railway to `vip_30d` or `rainbow_30d` to control how `sku=test` is routed.
 
+## BestServers vote postback
+
+Configure BestServers to send votes to:
+```
+https://railway-production-9e24.up.railway.app/bestservers/postback
+```
+
+Vote link format (pass the SteamID64 as the `USERNAME OR KEY`):
+```
+https://bestservers.com/server/{id}/vote/{STEAMID64}
+```
+
+Manual test example:
+```
+https://railway-production-9e24.up.railway.app/bestservers/postback?username=76561198000000000&userip=127.0.0.1&voted=1
+```
+
 ## Local test commands
 
 ### curl (JSON)

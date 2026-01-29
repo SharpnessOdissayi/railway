@@ -422,6 +422,8 @@ function delay(ms) {
 
 const processedTxCache = new Map();
 const recentTxIds = new Map();
+const voteDedupCache = new Map();
+const VOTE_DEDUP_TTL_MS = 10 * 60 * 1000;
 
 function pruneProcessedTxCache(now = Date.now()) {
   for (const [key, timestamp] of processedTxCache.entries()) {
@@ -443,6 +445,24 @@ function markProcessedTx(txnKey, now = Date.now()) {
 
 function markRecentTxId(txnKey, status, now = Date.now()) {
   recentTxIds.set(txnKey, { status, at: now });
+}
+
+function pruneVoteDedupCache(now = Date.now()) {
+  for (const [key, timestamp] of voteDedupCache.entries()) {
+    if (now - timestamp > VOTE_DEDUP_TTL_MS) {
+      voteDedupCache.delete(key);
+    }
+  }
+}
+
+function isVoteDeduped(steamid64, now = Date.now()) {
+  pruneVoteDedupCache(now);
+  return voteDedupCache.has(steamid64);
+}
+
+function markVoteDeduped(steamid64, now = Date.now()) {
+  pruneVoteDedupCache(now);
+  voteDedupCache.set(steamid64, now);
 }
 const STATUS_CACHE_TTL_MS = 10 * 1000;
 const STATUS_RAW_MAX = 600;
@@ -738,6 +758,40 @@ async function fetchServerStatus() {
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+app.get("/bestservers/postback", async (req, res) => {
+  const voted = pickFirst(req.query, ["voted"]);
+  if (String(voted).trim() !== "1") {
+    return res.status(200).json({ ok: true, ignored: true });
+  }
+
+  const steamid64 = pickFirst(req.query, ["username"]);
+  if (!/^\d{17}$/.test(steamid64)) {
+    return res.status(400).json({ ok: false, reason: "invalid_steamid64" });
+  }
+
+  if (isVoteDeduped(steamid64)) {
+    return res.status(200).json({ ok: true, deduped: true });
+  }
+
+  if (!isRconConfigured) {
+    return res.status(200).json({ ok: false, reason: "rcon_not_configured" });
+  }
+
+  try {
+    const command = `loverust.voteannounce ${steamid64}`;
+    await rconSend(command);
+    markVoteDeduped(steamid64);
+    await discordNotify({
+      content: `🗳️ Vote received\nSteamID: ${steamid64}\nSource: BestServers`,
+      steamid64,
+      product: "bestservers_vote"
+    });
+    return res.status(200).json({ ok: true, steamid64 });
+  } catch (err) {
+    console.warn("BestServers vote rejected: rcon_failed", err?.message || err);
+    return res.status(502).json({ ok: false, reason: "rcon_failed" });
+  }
+});
 app.options("/server/status", (_req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
