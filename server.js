@@ -42,6 +42,7 @@ const {
   // Behavior
   DRY_RUN = "false",
   TRAZNILA_NOTIFY_SECRET,
+  BESTSERVERS_SERVERKEY,
   PORT
 } = process.env;
 
@@ -52,6 +53,7 @@ function required(name, value) {
 }
 
 required("API_SECRET", API_SECRET);
+required("BESTSERVERS_SERVERKEY", BESTSERVERS_SERVERKEY);
 const isDryRun = DRY_RUN.toLowerCase() === "true";
 const isRconConfigured = !!(RCON_HOST && RCON_PORT && RCON_PASSWORD);
 const DISCORD_WEBHOOK_KEYS = [
@@ -422,8 +424,8 @@ function delay(ms) {
 
 const processedTxCache = new Map();
 const recentTxIds = new Map();
-const voteDedupCache = new Map();
-const VOTE_DEDUP_TTL_MS = 10 * 60 * 1000;
+const bestserversCooldownCache = new Map();
+const BESTSERVERS_COOLDOWN_MS = 2 * 60 * 1000;
 
 function pruneProcessedTxCache(now = Date.now()) {
   for (const [key, timestamp] of processedTxCache.entries()) {
@@ -447,22 +449,22 @@ function markRecentTxId(txnKey, status, now = Date.now()) {
   recentTxIds.set(txnKey, { status, at: now });
 }
 
-function pruneVoteDedupCache(now = Date.now()) {
-  for (const [key, timestamp] of voteDedupCache.entries()) {
-    if (now - timestamp > VOTE_DEDUP_TTL_MS) {
-      voteDedupCache.delete(key);
+function pruneBestserversCooldown(now = Date.now()) {
+  for (const [key, timestamp] of bestserversCooldownCache.entries()) {
+    if (now - timestamp > BESTSERVERS_COOLDOWN_MS) {
+      bestserversCooldownCache.delete(key);
     }
   }
 }
 
-function isVoteDeduped(steamid64, now = Date.now()) {
-  pruneVoteDedupCache(now);
-  return voteDedupCache.has(steamid64);
+function isBestserversCooldownActive(steamid64, now = Date.now()) {
+  pruneBestserversCooldown(now);
+  return bestserversCooldownCache.has(steamid64);
 }
 
-function markVoteDeduped(steamid64, now = Date.now()) {
-  pruneVoteDedupCache(now);
-  voteDedupCache.set(steamid64, now);
+function markBestserversCooldown(steamid64, now = Date.now()) {
+  pruneBestserversCooldown(now);
+  bestserversCooldownCache.set(steamid64, now);
 }
 const STATUS_CACHE_TTL_MS = 10 * 1000;
 const STATUS_RAW_MAX = 600;
@@ -759,37 +761,69 @@ async function fetchServerStatus() {
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 app.get("/bestservers/postback", async (req, res) => {
-  const voted = pickFirst(req.query, ["voted"]);
-  if (String(voted).trim() !== "1") {
-    return res.status(200).json({ ok: true, ignored: true });
-  }
-
   const steamid64 = pickFirst(req.query, ["username"]);
   if (!/^\d{17}$/.test(steamid64)) {
     return res.status(400).json({ ok: false, reason: "invalid_steamid64" });
   }
 
-  if (isVoteDeduped(steamid64)) {
-    return res.status(200).json({ ok: true, deduped: true });
+  if (isBestserversCooldownActive(steamid64)) {
+    return res.status(200).json({ ok: false, reason: "cooldown" });
   }
 
   if (!isRconConfigured) {
     return res.status(200).json({ ok: false, reason: "rcon_not_configured" });
   }
 
+  markBestserversCooldown(steamid64);
+  let verdict = "";
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const url = new URL("https://bestservers.com/api/vote.php");
+    url.searchParams.set("action", "claim");
+    url.searchParams.set("key", BESTSERVERS_SERVERKEY);
+    url.searchParams.set("steamid", steamid64);
+
+    const response = await fetch(url, { signal: controller.signal }).finally(() => {
+      clearTimeout(timeout);
+    });
+    const bodyText = await response.text();
+    verdict = bodyText.trim();
+  } catch (err) {
+    const message = err?.message || err;
+    if (String(message).toLowerCase().includes("abort")) {
+      console.warn("BestServers vote claim failed: timeout");
+    } else {
+      console.warn("BestServers vote claim failed:", message);
+    }
+    return res.status(200).json({ ok: false, reason: "bestservers_api_error" });
+  }
+
+  if (verdict === "2") {
+    return res.status(200).json({ ok: true, alreadyClaimed: true });
+  }
+
+  if (verdict === "0") {
+    return res.status(200).json({ ok: false, reason: "no_vote_or_invalid" });
+  }
+
+  if (verdict !== "1") {
+    console.warn("BestServers vote claim unexpected response:", verdict);
+    return res.status(200).json({ ok: false, reason: "bestservers_api_error" });
+  }
+
   try {
     const command = `loverust.voteannounce ${steamid64}`;
     await rconSend(command);
-    markVoteDeduped(steamid64);
     await discordNotify({
-      content: `🗳️ Vote received\nSteamID: ${steamid64}\nSource: BestServers`,
+      content: `🗳️ Vote verified & claimed\nSteamID: ${steamid64}\nSource: BestServers`,
       steamid64,
       product: "bestservers_vote"
     });
     return res.status(200).json({ ok: true, steamid64 });
   } catch (err) {
     console.warn("BestServers vote rejected: rcon_failed", err?.message || err);
-    return res.status(502).json({ ok: false, reason: "rcon_failed" });
+    return res.status(200).json({ ok: false, reason: "rcon_failed" });
   }
 });
 app.options("/server/status", (_req, res) => {

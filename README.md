@@ -11,6 +11,7 @@ This service receives Tranzila notify calls and grants VIP via Rust RCON. It sup
 | `RCON_HOST` | yes | Rust RCON host. |
 | `RCON_PORT` | yes | Rust RCON port. |
 | `RCON_PASSWORD` | yes | Rust RCON password. |
+| `BESTSERVERS_SERVERKEY` | yes | BestServers API server key for vote claim verification. |
 | `DB_PATH` | no | SQLite path (defaults to `./data.sqlite`). |
 | `DISCORD_WEBHOOK_URL` | no | Discord webhook for notifications (preferred). |
 | `DISCORD_WEBHOOK` | no | Alias for `DISCORD_WEBHOOK_URL`. |
@@ -85,6 +86,8 @@ Configure BestServers to send votes to:
 https://railway-production-9e24.up.railway.app/bestservers/postback
 ```
 
+Postbacks trigger a server-side verification + claim call to the BestServers API before rewards are granted.
+
 Vote link format (pass the SteamID64 as the `USERNAME OR KEY`):
 ```
 https://bestservers.com/server/{id}/vote/{STEAMID64}
@@ -92,7 +95,7 @@ https://bestservers.com/server/{id}/vote/{STEAMID64}
 
 Manual test example:
 ```
-https://railway-production-9e24.up.railway.app/bestservers/postback?username=76561198000000000&userip=127.0.0.1&voted=1
+https://railway-production-9e24.up.railway.app/bestservers/postback?username=76561198000000000&userip=127.0.0.1
 ```
 
 ## Local test commands
