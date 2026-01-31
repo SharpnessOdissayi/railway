@@ -45,6 +45,9 @@ const {
   TRAZNILA_NOTIFY_SECRET,
   BESTSERVERS_SERVERKEY,
   REFERRAL_SERVER_SECRET,
+  REFERRAL_API_TOKEN,
+  SESSION_SIGNING_SECRET,
+  REFCODE_SESSION_SECRET,
   PORT
 } = process.env;
 
@@ -54,9 +57,15 @@ function required(name, value) {
   if (!value) throw new Error(`Missing required env var: ${name}`);
 }
 
+function requiredAny(names, value) {
+  if (!value) throw new Error(`Missing required env var: one of ${names.join(", ")}`);
+}
+
 required("API_SECRET", API_SECRET);
 required("BESTSERVERS_SERVERKEY", BESTSERVERS_SERVERKEY);
-required("REFERRAL_SERVER_SECRET", REFERRAL_SERVER_SECRET);
+const referralApiToken = REFERRAL_API_TOKEN || REFERRAL_SERVER_SECRET;
+requiredAny(["REFERRAL_API_TOKEN", "REFERRAL_SERVER_SECRET"], referralApiToken);
+const sessionSigningSecret = SESSION_SIGNING_SECRET || REFCODE_SESSION_SECRET;
 const isDryRun = DRY_RUN.toLowerCase() === "true";
 const isRconConfigured = !!(RCON_HOST && RCON_PORT && RCON_PASSWORD);
 const DISCORD_WEBHOOK_KEYS = [
@@ -75,6 +84,11 @@ if (!isRconConfigured) {
 if (!hasDiscordWebhook) {
   console.warn(
     "Discord webhook is not configured (DISCORD_WEBHOOK_URL, DISCORD_WEBHOOK, or WEBHOOK_URL missing). Notifications will be skipped."
+  );
+}
+if (!sessionSigningSecret) {
+  console.warn(
+    "Session signing secret is not configured (SESSION_SIGNING_SECRET or REFCODE_SESSION_SECRET missing). Refcode sessions will fail."
   );
 }
 
@@ -192,9 +206,11 @@ async function initDb() {
       referredId TEXT NOT NULL UNIQUE,
       code TEXT NOT NULL UNIQUE,
       status TEXT NOT NULL,
+      displayName TEXT,
       confirmedAt TEXT,
       verifiedAt TEXT,
       playSecondsAtVerify INTEGER,
+      firstSeenAt TEXT,
       createdAt TEXT NOT NULL
     );
   `);
@@ -224,6 +240,25 @@ async function initDb() {
   await db.exec(
     "CREATE INDEX IF NOT EXISTS portal_codes_expiry ON portal_codes (expiresAt);"
   );
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS refcodes (
+      code TEXT PRIMARY KEY,
+      steamid64 TEXT NOT NULL,
+      displayName TEXT,
+      expiresAt TEXT NOT NULL,
+      issuedAt TEXT NOT NULL
+    );
+  `);
+
+  await db.exec(
+    "CREATE INDEX IF NOT EXISTS refcodes_expiry ON refcodes (expiresAt);"
+  );
+  await db.exec(
+    "CREATE INDEX IF NOT EXISTS refcodes_steamid64 ON refcodes (steamid64);"
+  );
+
+  await ensureReferralColumns(db);
 
   return db;
 }
@@ -514,14 +549,24 @@ const REFERRAL_CODE_LENGTH = 6;
 const REFERRAL_CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const REFERRAL_REQUIRED_VERIFIED = 5;
 const REFERRAL_VERIFY_THRESHOLD_SECONDS = 86400;
+const REFERRAL_REQUIRED_AGE_DAYS = 7;
 const PORTAL_CODE_LENGTH = 4;
 const PORTAL_CODE_TTL_MS = 10 * 60 * 1000;
 const PORTAL_CODE_MAX_ATTEMPTS = 6;
+const REF_CODE_TTL_MS = 5 * 60 * 1000;
+const REF_CODE_ISSUE_COOLDOWN_MS = 15 * 1000;
+const REF_CODE_CONSUME_RATE_LIMIT = {
+  limit: 5,
+  windowMs: 60 * 1000
+};
+const REF_CODE_SESSION_TTL_MS = 10 * 60 * 1000;
 const PORTAL_STATUS_RATE_LIMIT = {
   limit: 10,
   windowMs: 60 * 1000
 };
 const portalStatusRateCache = new Map();
+const refcodeIssueRateCache = new Map();
+const refcodeConsumeRateCache = new Map();
 
 function isValidSteamId64(value) {
   return /^\d{17}$/.test(String(value || "").trim());
@@ -585,11 +630,15 @@ function getReferralAuthToken(req) {
 
 function isReferralAuthorized(req) {
   const token = getReferralAuthToken(req);
-  return token && token === REFERRAL_SERVER_SECRET;
+  return Boolean(token && referralApiToken && token === referralApiToken);
 }
 
 async function cleanupExpiredPortalCodes(db, nowIso = new Date().toISOString()) {
   await db.run("DELETE FROM portal_codes WHERE expiresAt <= ?", nowIso);
+}
+
+async function cleanupExpiredRefcodes(db, nowIso = new Date().toISOString()) {
+  await db.run("DELETE FROM refcodes WHERE expiresAt <= ?", nowIso);
 }
 
 async function consumePortalCode(db, code) {
@@ -611,6 +660,152 @@ async function consumePortalCode(db, code) {
   } catch (err) {
     await db.exec("ROLLBACK");
     throw err;
+  }
+}
+
+async function consumeRefcode(db, code) {
+  const nowIso = new Date().toISOString();
+  await db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = await db.get(
+      "SELECT code, steamid64, displayName, expiresAt FROM refcodes WHERE code = ? AND expiresAt > ?",
+      code,
+      nowIso
+    );
+    if (!row) {
+      await db.exec("ROLLBACK");
+      return null;
+    }
+    await db.run("DELETE FROM refcodes WHERE code = ?", code);
+    await db.exec("COMMIT");
+    return row;
+  } catch (err) {
+    await db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+function isRefcodeConsumeRateLimited(req, now = Date.now()) {
+  const ip = getRequestIp(req);
+  const record = refcodeConsumeRateCache.get(ip);
+  if (!record || now >= record.resetAt) {
+    refcodeConsumeRateCache.set(ip, { count: 1, resetAt: now + REF_CODE_CONSUME_RATE_LIMIT.windowMs });
+    return false;
+  }
+  if (record.count >= REF_CODE_CONSUME_RATE_LIMIT.limit) {
+    return true;
+  }
+  record.count += 1;
+  refcodeConsumeRateCache.set(ip, record);
+  return false;
+}
+
+function isRefcodeIssueRateLimited(steamid64, now = Date.now()) {
+  const record = refcodeIssueRateCache.get(steamid64);
+  if (!record || now - record >= REF_CODE_ISSUE_COOLDOWN_MS) {
+    refcodeIssueRateCache.set(steamid64, now);
+    return false;
+  }
+  return true;
+}
+
+function base64UrlEncode(input) {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function base64UrlDecode(input) {
+  let value = input.replace(/-/g, "+").replace(/_/g, "/");
+  const padding = value.length % 4;
+  if (padding) {
+    value += "=".repeat(4 - padding);
+  }
+  return Buffer.from(value, "base64").toString("utf8");
+}
+
+function signSessionToken({ steamid64, ttlMs = REF_CODE_SESSION_TTL_MS }) {
+  if (!sessionSigningSecret) {
+    throw new Error("session_secret_missing");
+  }
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const header = base64UrlEncode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const payload = base64UrlEncode(JSON.stringify({
+    steamid64,
+    iat: nowSeconds,
+    exp: nowSeconds + Math.floor(ttlMs / 1000)
+  }));
+  const signingInput = `${header}.${payload}`;
+  const signature = crypto
+    .createHmac("sha256", sessionSigningSecret)
+    .update(signingInput)
+    .digest("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+  return `${signingInput}.${signature}`;
+}
+
+function verifySessionToken(token) {
+  if (!sessionSigningSecret) return null;
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [header, payload, signature] = parts;
+  const signingInput = `${header}.${payload}`;
+  const expected = crypto
+    .createHmac("sha256", sessionSigningSecret)
+    .update(signingInput)
+    .digest("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+  const signatureBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (signatureBuffer.length !== expectedBuffer.length) return null;
+  if (!crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) return null;
+  try {
+    const parsed = JSON.parse(base64UrlDecode(payload));
+    const exp = Number(parsed?.exp);
+    if (!Number.isFinite(exp)) return null;
+    if (Math.floor(Date.now() / 1000) >= exp) return null;
+    if (!isValidSteamId64(parsed?.steamid64)) return null;
+    return parsed;
+  } catch (err) {
+    return null;
+  }
+}
+
+function requirePluginToken(req, res, next) {
+  if (!referralApiToken) {
+    return res.status(500).json({ ok: false, error: "referral_token_not_configured" });
+  }
+  if (!isReferralAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  return next();
+}
+
+function requireSessionToken(req, res, next) {
+  const token = getReferralAuthToken(req);
+  const payload = verifySessionToken(token);
+  if (!payload) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  req.session = payload;
+  return next();
+}
+
+async function ensureReferralColumns(db) {
+  const columns = await db.all("PRAGMA table_info(referrals)");
+  const names = new Set(columns.map((column) => column.name));
+  if (!names.has("displayName")) {
+    await db.exec("ALTER TABLE referrals ADD COLUMN displayName TEXT;");
+  }
+  if (!names.has("firstSeenAt")) {
+    await db.exec("ALTER TABLE referrals ADD COLUMN firstSeenAt TEXT;");
   }
 }
 const STATUS_CACHE_TTL_MS = 10 * 1000;
@@ -907,6 +1102,129 @@ async function fetchServerStatus() {
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+app.get("/api/referrals/rules", (_req, res) => {
+  return res.status(200).json({
+    requiredVerified: REFERRAL_REQUIRED_VERIFIED,
+    requiredPlayHours: Math.floor(REFERRAL_VERIFY_THRESHOLD_SECONDS / 3600),
+    requiredAgeDays: REFERRAL_REQUIRED_AGE_DAYS,
+    reward: "$10 Steam Gift Card"
+  });
+});
+app.post("/api/refcode/issue", requirePluginToken, async (req, res) => {
+  try {
+    const body = coerceBody(req);
+    const steamid64 = String(body?.steamid64 || "").trim();
+    const displayName = body?.displayName ? String(body.displayName).trim() : null;
+    if (!isValidSteamId64(steamid64)) {
+      return res.status(400).json({ ok: false, error: "invalid_steamid64" });
+    }
+    if (isRefcodeIssueRateLimited(steamid64)) {
+      return res.status(429).json({ ok: false, error: "rate_limited" });
+    }
+
+    const db = await dbPromise;
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    await cleanupExpiredRefcodes(db, nowIso);
+    await db.run("DELETE FROM refcodes WHERE steamid64 = ?", steamid64);
+
+    let code = "";
+    for (let attempt = 0; attempt < PORTAL_CODE_MAX_ATTEMPTS; attempt += 1) {
+      const candidate = generatePortalCode();
+      const existing = await db.get(
+        "SELECT code FROM refcodes WHERE code = ? AND expiresAt > ?",
+        candidate,
+        nowIso
+      );
+      if (existing) {
+        continue;
+      }
+      const expiresAtIso = new Date(now + REF_CODE_TTL_MS).toISOString();
+      try {
+        await db.run(
+          "INSERT INTO refcodes (code, steamid64, displayName, expiresAt, issuedAt) VALUES (?, ?, ?, ?, ?)",
+          candidate,
+          steamid64,
+          displayName,
+          expiresAtIso,
+          nowIso
+        );
+        code = candidate;
+        break;
+      } catch (err) {
+        if (String(err?.message || "").toLowerCase().includes("constraint")) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!code) {
+      return res.status(503).json({ ok: false, error: "code_generation_failed" });
+    }
+
+    return res.status(200).json({
+      code,
+      expiresAt: new Date(now + REF_CODE_TTL_MS).toISOString()
+    });
+  } catch (err) {
+    console.warn("Refcode issue error:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+app.post("/api/refcode/revoke", requirePluginToken, async (req, res) => {
+  try {
+    const body = coerceBody(req);
+    const steamid64 = String(body?.steamid64 || "").trim();
+    if (!isValidSteamId64(steamid64)) {
+      return res.status(400).json({ ok: false, error: "invalid_steamid64" });
+    }
+    const db = await dbPromise;
+    await db.run("DELETE FROM refcodes WHERE steamid64 = ?", steamid64);
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    console.warn("Refcode revoke error:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+app.post("/api/refcode/consume", async (req, res) => {
+  if (isRefcodeConsumeRateLimited(req)) {
+    return res.status(429).json({ ok: false, message: "Too many attempts. Try again soon." });
+  }
+
+  try {
+    const body = coerceBody(req);
+    const code = normalizePortalCode(body?.code);
+    if (!isValidPortalCode(code)) {
+      return res.status(400).json({ ok: false, message: "Invalid or expired code" });
+    }
+
+    const db = await dbPromise;
+    await cleanupExpiredRefcodes(db);
+    const refcodeRow = await consumeRefcode(db, code);
+    if (!refcodeRow) {
+      return res.status(400).json({ ok: false, message: "Invalid or expired code" });
+    }
+
+    let token;
+    try {
+      token = signSessionToken({ steamid64: refcodeRow.steamid64 });
+    } catch (err) {
+      return res.status(500).json({ ok: false, message: "Session token unavailable" });
+    }
+
+    const expiresAt = new Date(Date.now() + REF_CODE_SESSION_TTL_MS).toISOString();
+    return res.status(200).json({
+      ok: true,
+      steamid64: refcodeRow.steamid64,
+      token,
+      expiresAt
+    });
+  } catch (err) {
+    console.warn("Refcode consume error:", err?.message || err);
+    return res.status(500).json({ ok: false, message: "Server error" });
+  }
+});
 app.get("/bestservers/postback", async (req, res) => {
   const steamid64 = pickFirst(req.query, ["username"]);
   if (!/^\d{17}$/.test(steamid64)) {
@@ -1025,11 +1343,7 @@ app.get("/server/status", async (req, res) => {
     return res.status(200).json(payload);
   }
 });
-app.post("/api/referrals/portal-code", async (req, res) => {
-  if (!isReferralAuthorized(req)) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-
+app.post("/api/referrals/portal-code", requirePluginToken, async (req, res) => {
   try {
     const body = coerceBody(req);
     const steamid64 = String(body?.steamid64 || "").trim();
@@ -1143,6 +1457,50 @@ app.get("/api/referrals/portal-status", async (req, res) => {
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
+app.get("/api/referrals/me", requireSessionToken, async (req, res) => {
+  try {
+    const steamid64 = req.session?.steamid64;
+    const db = await dbPromise;
+    const referralRows = await db.all(
+      `SELECT referredId, status, confirmedAt, verifiedAt, playSecondsAtVerify, displayName, firstSeenAt, createdAt
+       FROM referrals WHERE referrerId = ?
+       ORDER BY createdAt DESC`,
+      steamid64
+    );
+    const countRow = await db.get(
+      "SELECT COUNT(*) AS count FROM referrals WHERE referrerId = ? AND status = 'verified'",
+      steamid64
+    );
+    const verifiedCount = Number(countRow?.count || 0);
+    const meta = await db.get(
+      "SELECT eligibleAt, paidAt FROM referrer_meta WHERE referrerId = ?",
+      steamid64
+    );
+    const eligibleAt = meta?.eligibleAt || null;
+    const paidAt = meta?.paidAt || null;
+
+    return res.status(200).json({
+      verifiedCount,
+      eligible: Boolean(eligibleAt),
+      eligibleAt,
+      paidAt,
+      referrals: referralRows.map((row) => ({
+        referredId: row.referredId,
+        displayName: row.displayName || null,
+        status: row.status,
+        confirmedAt: row.confirmedAt,
+        verifiedAt: row.verifiedAt,
+        playtimeHours: Number.isFinite(row.playSecondsAtVerify)
+          ? Math.round((row.playSecondsAtVerify / 3600) * 10) / 10
+          : null,
+        firstSeenAt: row.firstSeenAt || row.createdAt
+      }))
+    });
+  } catch (err) {
+    console.warn("Referrals me error:", err?.message || err);
+    return res.status(500).json({ ok: false, reason: "server_error" });
+  }
+});
 app.post("/api/referrals/request", async (req, res) => {
   try {
     const body = coerceBody(req);
@@ -1199,11 +1557,67 @@ app.post("/api/referrals/request", async (req, res) => {
     return res.status(500).json({ ok: false, reason: "server_error" });
   }
 });
-app.post("/api/referrals/confirm", async (req, res) => {
-  if (!isReferralAuthorized(req)) {
-    return res.status(401).json({ ok: false, reason: "unauthorized" });
-  }
+app.post("/api/referrals/accept", requirePluginToken, async (req, res) => {
+  try {
+    const body = coerceBody(req);
+    const referrerId = String(body?.referrerId || "").trim();
+    const referredId = String(body?.referredId || "").trim();
+    const code = normalizeReferralCode(body?.code);
+    const acceptedBy = String(body?.acceptedBy || "").trim();
+    const displayName = body?.displayName ? String(body.displayName).trim() : null;
 
+    if (!isValidSteamId64(referredId)) {
+      return res.status(400).json({ ok: false, reason: "invalid_referred_id" });
+    }
+    if (referrerId && !isValidSteamId64(referrerId)) {
+      return res.status(400).json({ ok: false, reason: "invalid_referrer_id" });
+    }
+    if (code && !/^[A-Z0-9]{6}$/.test(code)) {
+      return res.status(400).json({ ok: false, reason: "invalid_code" });
+    }
+    if (acceptedBy && acceptedBy !== "referred") {
+      return res.status(400).json({ ok: false, reason: "invalid_accepted_by" });
+    }
+
+    const db = await dbPromise;
+    const referral = await db.get(
+      `SELECT id, status
+       FROM referrals
+       WHERE referredId = ?
+         AND (? = '' OR referrerId = ?)
+         AND (? = '' OR code = ?)`,
+      referredId,
+      referrerId,
+      referrerId,
+      code,
+      code
+    );
+    if (!referral) {
+      return res.status(404).json({ ok: false, reason: "not_found" });
+    }
+    if (referral.status === "pending") {
+      await db.run(
+        "UPDATE referrals SET status = ?, confirmedAt = ?, displayName = COALESCE(displayName, ?) WHERE id = ?",
+        "confirmed",
+        new Date().toISOString(),
+        displayName,
+        referral.id
+      );
+    } else if (displayName) {
+      await db.run(
+        "UPDATE referrals SET displayName = COALESCE(displayName, ?) WHERE id = ?",
+        displayName,
+        referral.id
+      );
+    }
+
+    return res.status(200).json({ ok: true, status: referral.status === "pending" ? "confirmed" : referral.status });
+  } catch (err) {
+    console.warn("Referral accept error:", err?.message || err);
+    return res.status(500).json({ ok: false, reason: "server_error" });
+  }
+});
+app.post("/api/referrals/confirm", requirePluginToken, async (req, res) => {
   try {
     const body = coerceBody(req);
     const referredId = String(body?.referredId || "").trim();
@@ -1246,15 +1660,12 @@ app.post("/api/referrals/confirm", async (req, res) => {
     return res.status(500).json({ ok: false, reason: "server_error" });
   }
 });
-app.post("/api/referrals/verify", async (req, res) => {
-  if (!isReferralAuthorized(req)) {
-    return res.status(401).json({ ok: false, reason: "unauthorized" });
-  }
-
+app.post("/api/referrals/verify", requirePluginToken, async (req, res) => {
   try {
     const body = coerceBody(req);
     const referredId = String(body?.referredId || "").trim();
     const totalPlaySeconds = Number(body?.totalPlaySeconds);
+    const firstSeenAtInput = body?.firstSeenAt ? String(body.firstSeenAt).trim() : "";
 
     if (!isValidSteamId64(referredId)) {
       return res.status(400).json({ ok: false, reason: "invalid_steamid64" });
@@ -1273,10 +1684,25 @@ app.post("/api/referrals/verify", async (req, res) => {
     }
 
     let status = referral.status;
-    if (
-      totalPlaySeconds >= REFERRAL_VERIFY_THRESHOLD_SECONDS &&
-      referral.status !== "verified"
-    ) {
+    const parsedFirstSeen = firstSeenAtInput ? new Date(firstSeenAtInput) : null;
+    const storedFirstSeen = referral.firstSeenAt ? new Date(referral.firstSeenAt) : null;
+    const firstSeenAt = parsedFirstSeen && !Number.isNaN(parsedFirstSeen.getTime())
+      ? parsedFirstSeen
+      : storedFirstSeen;
+    const meetsPlaytime = totalPlaySeconds >= REFERRAL_VERIFY_THRESHOLD_SECONDS;
+    const meetsAge =
+      firstSeenAt && Date.now() - firstSeenAt.getTime() >= REFERRAL_REQUIRED_AGE_DAYS * 24 * 60 * 60 * 1000;
+    const canVerify = status === "confirmed" || status === "verified";
+
+    if (parsedFirstSeen && !Number.isNaN(parsedFirstSeen.getTime())) {
+      await db.run(
+        "UPDATE referrals SET firstSeenAt = COALESCE(firstSeenAt, ?) WHERE id = ?",
+        parsedFirstSeen.toISOString(),
+        referral.id
+      );
+    }
+
+    if (canVerify && meetsPlaytime && meetsAge && referral.status !== "verified") {
       await db.run(
         `UPDATE referrals
          SET status = ?, verifiedAt = ?, playSecondsAtVerify = ?
@@ -1322,7 +1748,10 @@ app.post("/api/referrals/verify", async (req, res) => {
       ok: true,
       status,
       verifiedCount,
-      eligible: Boolean(nextEligibleAt)
+      eligible: Boolean(nextEligibleAt),
+      meetsPlaytime,
+      meetsAge,
+      firstSeenAt: firstSeenAt ? firstSeenAt.toISOString() : null
     });
   } catch (err) {
     console.warn("Referral verify error:", err?.message || err);
@@ -1786,9 +2215,17 @@ setInterval(() => {
   processExpiredPortalCodes().catch((err) => {
     console.error("Failed to process expired portal codes:", err);
   });
+  processExpiredRefcodes().catch((err) => {
+    console.error("Failed to process expired refcodes:", err);
+  });
 }, 60 * 1000);
 
 async function processExpiredPortalCodes() {
   const db = await dbPromise;
   await cleanupExpiredPortalCodes(db);
+}
+
+async function processExpiredRefcodes() {
+  const db = await dbPromise;
+  await cleanupExpiredRefcodes(db);
 }
