@@ -19,6 +19,13 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.use(express.text({ type: ["text/plain"], limit: "1mb" }));
+app.use((req, res, next) => {
+  res.on("finish", () => {
+    const path = req.originalUrl || req.url;
+    console.log(`[request] ${req.method} ${path} ${res.statusCode}`);
+  });
+  next();
+});
 app.use((err, req, _res, next) => {
   if (err?.type === "entity.parse.failed") {
     console.warn("Body parse failed; continuing with empty body.");
@@ -45,8 +52,6 @@ const {
   TRAZNILA_NOTIFY_SECRET,
   BESTSERVERS_SERVERKEY,
   REFERRAL_SERVER_SECRET,
-  REFERRAL_API_TOKEN,
-  SESSION_SIGNING_SECRET,
   REFCODE_SESSION_SECRET,
   PORT
 } = process.env;
@@ -57,15 +62,10 @@ function required(name, value) {
   if (!value) throw new Error(`Missing required env var: ${name}`);
 }
 
-function requiredAny(names, value) {
-  if (!value) throw new Error(`Missing required env var: one of ${names.join(", ")}`);
-}
-
 required("API_SECRET", API_SECRET);
 required("BESTSERVERS_SERVERKEY", BESTSERVERS_SERVERKEY);
-const referralApiToken = REFERRAL_API_TOKEN || REFERRAL_SERVER_SECRET;
-requiredAny(["REFERRAL_API_TOKEN", "REFERRAL_SERVER_SECRET"], referralApiToken);
-const sessionSigningSecret = SESSION_SIGNING_SECRET || REFCODE_SESSION_SECRET;
+required("REFERRAL_SERVER_SECRET", REFERRAL_SERVER_SECRET);
+required("REFCODE_SESSION_SECRET", REFCODE_SESSION_SECRET);
 const isDryRun = DRY_RUN.toLowerCase() === "true";
 const isRconConfigured = !!(RCON_HOST && RCON_PORT && RCON_PASSWORD);
 const DISCORD_WEBHOOK_KEYS = [
@@ -86,11 +86,7 @@ if (!hasDiscordWebhook) {
     "Discord webhook is not configured (DISCORD_WEBHOOK_URL, DISCORD_WEBHOOK, or WEBHOOK_URL missing). Notifications will be skipped."
   );
 }
-if (!sessionSigningSecret) {
-  console.warn(
-    "Session signing secret is not configured (SESSION_SIGNING_SECRET or REFCODE_SESSION_SECRET missing). Refcode sessions will fail."
-  );
-}
+const referralServerSecret = REFERRAL_SERVER_SECRET;
 
 const DATABASE_PATH = DB_PATH || "./data.sqlite";
 const PROCESSED_TTL_MS = 24 * 60 * 60 * 1000;
@@ -200,65 +196,56 @@ async function initDb() {
   );
 
   await db.exec(`
-    CREATE TABLE IF NOT EXISTS referrals (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      referrerId TEXT NOT NULL,
-      referredId TEXT NOT NULL UNIQUE,
-      code TEXT NOT NULL UNIQUE,
-      status TEXT NOT NULL,
-      displayName TEXT,
-      confirmedAt TEXT,
-      verifiedAt TEXT,
-      playSecondsAtVerify INTEGER,
-      firstSeenAt TEXT,
-      createdAt TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS players (
+      steamid64 TEXT PRIMARY KEY,
+      first_seen_utc TEXT NOT NULL
     );
   `);
-
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS referrer_meta (
-      referrerId TEXT PRIMARY KEY,
-      verifiedCount INTEGER NOT NULL DEFAULT 0,
-      eligibleAt TEXT,
-      paidAt TEXT
-    );
-  `);
-
-  await db.exec(
-    "CREATE INDEX IF NOT EXISTS referrals_referrer ON referrals (referrerId, status);"
-  );
-
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS portal_codes (
-      code TEXT PRIMARY KEY,
-      steamid64 TEXT NOT NULL,
-      expiresAt TEXT NOT NULL,
-      createdAt TEXT NOT NULL
-    );
-  `);
-
-  await db.exec(
-    "CREATE INDEX IF NOT EXISTS portal_codes_expiry ON portal_codes (expiresAt);"
-  );
 
   await db.exec(`
     CREATE TABLE IF NOT EXISTS refcodes (
       code TEXT PRIMARY KEY,
-      steamid64 TEXT NOT NULL,
-      displayName TEXT,
-      expiresAt TEXT NOT NULL,
-      issuedAt TEXT NOT NULL
+      owner_steamid64 TEXT NOT NULL,
+      created_utc TEXT NOT NULL,
+      expires_utc TEXT NOT NULL,
+      used_by_steamid64 TEXT,
+      used_utc TEXT,
+      code_signature TEXT
     );
   `);
 
-  await db.exec(
-    "CREATE INDEX IF NOT EXISTS refcodes_expiry ON refcodes (expiresAt);"
-  );
-  await db.exec(
-    "CREATE INDEX IF NOT EXISTS refcodes_steamid64 ON refcodes (steamid64);"
-  );
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS referrals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      referrer_steamid64 TEXT NOT NULL,
+      referred_steamid64 TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_utc TEXT NOT NULL,
+      confirmed_utc TEXT,
+      verified_utc TEXT,
+      total_play_seconds INTEGER,
+      real_play_seconds INTEGER,
+      first_seen_utc TEXT
+    );
+  `);
 
-  await ensureReferralColumns(db);
+  await ensureReferralSchema(db);
+
+  await db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS referrals_unique_pair ON referrals (referrer_steamid64, referred_steamid64);"
+  );
+  await db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS referrals_unique_referred ON referrals (referred_steamid64);"
+  );
+  await db.exec(
+    "CREATE INDEX IF NOT EXISTS referrals_referrer_status ON referrals (referrer_steamid64, status);"
+  );
+  await db.exec(
+    "CREATE INDEX IF NOT EXISTS refcodes_expiry ON refcodes (expires_utc);"
+  );
+  await db.exec(
+    "CREATE INDEX IF NOT EXISTS refcodes_owner ON refcodes (owner_steamid64);"
+  );
 
   return db;
 }
@@ -545,81 +532,29 @@ function markBestserversCooldown(steamid64, now = Date.now()) {
   bestserversCooldownCache.set(steamid64, now);
 }
 
-const REFERRAL_CODE_LENGTH = 6;
-const REFERRAL_CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const REFERRAL_REQUIRED_VERIFIED = 5;
-const REFERRAL_VERIFY_THRESHOLD_SECONDS = 86400;
-const REFERRAL_REQUIRED_AGE_DAYS = 7;
-const PORTAL_CODE_LENGTH = 4;
-const PORTAL_CODE_TTL_MS = 10 * 60 * 1000;
-const PORTAL_CODE_MAX_ATTEMPTS = 6;
-const REF_CODE_TTL_MS = 5 * 60 * 1000;
-const REF_CODE_ISSUE_COOLDOWN_MS = 15 * 1000;
-const REF_CODE_CONSUME_RATE_LIMIT = {
-  limit: 5,
-  windowMs: 60 * 1000
-};
-const REF_CODE_SESSION_TTL_MS = 10 * 60 * 1000;
-const PORTAL_STATUS_RATE_LIMIT = {
-  limit: 10,
-  windowMs: 60 * 1000
-};
-const portalStatusRateCache = new Map();
-const refcodeIssueRateCache = new Map();
-const refcodeConsumeRateCache = new Map();
+const REF_CODE_LENGTH = 4;
+const REF_CODE_TTL_MS = 10 * 60 * 1000;
+const REF_CODE_MAX_ATTEMPTS = 20;
 
 function isValidSteamId64(value) {
   return /^\d{17}$/.test(String(value || "").trim());
 }
 
-function normalizeReferralCode(value) {
-  return String(value || "").trim().toUpperCase();
+function generateRefcode() {
+  const value = crypto.randomInt(0, 10 ** REF_CODE_LENGTH);
+  return String(value).padStart(REF_CODE_LENGTH, "0");
 }
 
-function generateReferralCode() {
-  const bytes = crypto.randomBytes(REFERRAL_CODE_LENGTH);
-  let code = "";
-  for (const byte of bytes) {
-    code += REFERRAL_CODE_ALPHABET[byte % REFERRAL_CODE_ALPHABET.length];
-  }
-  return code;
-}
-
-function generatePortalCode() {
-  const value = crypto.randomInt(0, 10 ** PORTAL_CODE_LENGTH);
-  return String(value).padStart(PORTAL_CODE_LENGTH, "0");
-}
-
-function normalizePortalCode(value) {
-  return String(value || "").trim();
-}
-
-function isValidPortalCode(value) {
+function isValidRefcode(value) {
   return /^\d{4}$/.test(String(value || ""));
 }
 
-function getRequestIp(req) {
-  const header = req.headers["x-forwarded-for"];
-  if (header) {
-    const parts = String(header).split(",").map((part) => part.trim()).filter(Boolean);
-    if (parts.length > 0) return parts[0];
-  }
-  return req.ip || req.connection?.remoteAddress || "unknown";
-}
-
-function isPortalStatusRateLimited(req, now = Date.now()) {
-  const ip = getRequestIp(req);
-  const record = portalStatusRateCache.get(ip);
-  if (!record || now >= record.resetAt) {
-    portalStatusRateCache.set(ip, { count: 1, resetAt: now + PORTAL_STATUS_RATE_LIMIT.windowMs });
-    return false;
-  }
-  if (record.count >= PORTAL_STATUS_RATE_LIMIT.limit) {
-    return true;
-  }
-  record.count += 1;
-  portalStatusRateCache.set(ip, record);
-  return false;
+function signRefcode(code) {
+  return crypto
+    .createHmac("sha256", REFCODE_SESSION_SECRET)
+    .update(code)
+    .digest("hex");
 }
 
 function getReferralAuthToken(req) {
@@ -630,182 +565,68 @@ function getReferralAuthToken(req) {
 
 function isReferralAuthorized(req) {
   const token = getReferralAuthToken(req);
-  return Boolean(token && referralApiToken && token === referralApiToken);
-}
-
-async function cleanupExpiredPortalCodes(db, nowIso = new Date().toISOString()) {
-  await db.run("DELETE FROM portal_codes WHERE expiresAt <= ?", nowIso);
+  return Boolean(token && referralServerSecret && token === referralServerSecret);
 }
 
 async function cleanupExpiredRefcodes(db, nowIso = new Date().toISOString()) {
-  await db.run("DELETE FROM refcodes WHERE expiresAt <= ?", nowIso);
+  await db.run("DELETE FROM refcodes WHERE expires_utc <= ?", nowIso);
 }
 
-async function consumePortalCode(db, code) {
-  const nowIso = new Date().toISOString();
-  await db.exec("BEGIN IMMEDIATE");
-  try {
-    const row = await db.get(
-      "SELECT code, steamid64, expiresAt FROM portal_codes WHERE code = ? AND expiresAt > ?",
-      code,
-      nowIso
-    );
-    if (!row) {
-      await db.exec("ROLLBACK");
-      return null;
-    }
-    await db.run("DELETE FROM portal_codes WHERE code = ?", code);
-    await db.exec("COMMIT");
-    return row;
-  } catch (err) {
-    await db.exec("ROLLBACK");
-    throw err;
-  }
+function sendError(res, status, message) {
+  return res.status(status).json({ ok: false, message });
 }
 
-async function consumeRefcode(db, code) {
-  const nowIso = new Date().toISOString();
-  await db.exec("BEGIN IMMEDIATE");
-  try {
-    const row = await db.get(
-      "SELECT code, steamid64, displayName, expiresAt FROM refcodes WHERE code = ? AND expiresAt > ?",
-      code,
-      nowIso
-    );
-    if (!row) {
-      await db.exec("ROLLBACK");
-      return null;
-    }
-    await db.run("DELETE FROM refcodes WHERE code = ?", code);
-    await db.exec("COMMIT");
-    return row;
-  } catch (err) {
-    await db.exec("ROLLBACK");
-    throw err;
-  }
-}
-
-function isRefcodeConsumeRateLimited(req, now = Date.now()) {
-  const ip = getRequestIp(req);
-  const record = refcodeConsumeRateCache.get(ip);
-  if (!record || now >= record.resetAt) {
-    refcodeConsumeRateCache.set(ip, { count: 1, resetAt: now + REF_CODE_CONSUME_RATE_LIMIT.windowMs });
-    return false;
-  }
-  if (record.count >= REF_CODE_CONSUME_RATE_LIMIT.limit) {
-    return true;
-  }
-  record.count += 1;
-  refcodeConsumeRateCache.set(ip, record);
-  return false;
-}
-
-function isRefcodeIssueRateLimited(steamid64, now = Date.now()) {
-  const record = refcodeIssueRateCache.get(steamid64);
-  if (!record || now - record >= REF_CODE_ISSUE_COOLDOWN_MS) {
-    refcodeIssueRateCache.set(steamid64, now);
-    return false;
-  }
-  return true;
-}
-
-function base64UrlEncode(input) {
-  return Buffer.from(input)
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-}
-
-function base64UrlDecode(input) {
-  let value = input.replace(/-/g, "+").replace(/_/g, "/");
-  const padding = value.length % 4;
-  if (padding) {
-    value += "=".repeat(4 - padding);
-  }
-  return Buffer.from(value, "base64").toString("utf8");
-}
-
-function signSessionToken({ steamid64, ttlMs = REF_CODE_SESSION_TTL_MS }) {
-  if (!sessionSigningSecret) {
-    throw new Error("session_secret_missing");
-  }
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const header = base64UrlEncode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const payload = base64UrlEncode(JSON.stringify({
-    steamid64,
-    iat: nowSeconds,
-    exp: nowSeconds + Math.floor(ttlMs / 1000)
-  }));
-  const signingInput = `${header}.${payload}`;
-  const signature = crypto
-    .createHmac("sha256", sessionSigningSecret)
-    .update(signingInput)
-    .digest("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-  return `${signingInput}.${signature}`;
-}
-
-function verifySessionToken(token) {
-  if (!sessionSigningSecret) return null;
-  if (!token) return null;
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [header, payload, signature] = parts;
-  const signingInput = `${header}.${payload}`;
-  const expected = crypto
-    .createHmac("sha256", sessionSigningSecret)
-    .update(signingInput)
-    .digest("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-  const signatureBuffer = Buffer.from(signature);
-  const expectedBuffer = Buffer.from(expected);
-  if (signatureBuffer.length !== expectedBuffer.length) return null;
-  if (!crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) return null;
-  try {
-    const parsed = JSON.parse(base64UrlDecode(payload));
-    const exp = Number(parsed?.exp);
-    if (!Number.isFinite(exp)) return null;
-    if (Math.floor(Date.now() / 1000) >= exp) return null;
-    if (!isValidSteamId64(parsed?.steamid64)) return null;
-    return parsed;
-  } catch (err) {
-    return null;
-  }
-}
-
-function requirePluginToken(req, res, next) {
-  if (!referralApiToken) {
-    return res.status(500).json({ ok: false, error: "referral_token_not_configured" });
-  }
+function requireReferralAuth(req, res, next) {
   if (!isReferralAuthorized(req)) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
+    return sendError(res, 401, "unauthorized");
   }
   return next();
 }
 
-function requireSessionToken(req, res, next) {
-  const token = getReferralAuthToken(req);
-  const payload = verifySessionToken(token);
-  if (!payload) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
+async function ensureReferralSchema(db) {
+  const referralColumns = await db.all("PRAGMA table_info(referrals)");
+  const referralNames = new Set(referralColumns.map((column) => column.name));
+  const referralAdds = [
+    ["referrer_steamid64", "TEXT"],
+    ["referred_steamid64", "TEXT"],
+    ["status", "TEXT"],
+    ["created_utc", "TEXT"],
+    ["confirmed_utc", "TEXT"],
+    ["verified_utc", "TEXT"],
+    ["total_play_seconds", "INTEGER"],
+    ["real_play_seconds", "INTEGER"],
+    ["first_seen_utc", "TEXT"]
+  ];
+  for (const [name, type] of referralAdds) {
+    if (!referralNames.has(name)) {
+      await db.exec(`ALTER TABLE referrals ADD COLUMN ${name} ${type};`);
+    }
   }
-  req.session = payload;
-  return next();
-}
 
-async function ensureReferralColumns(db) {
-  const columns = await db.all("PRAGMA table_info(referrals)");
-  const names = new Set(columns.map((column) => column.name));
-  if (!names.has("displayName")) {
-    await db.exec("ALTER TABLE referrals ADD COLUMN displayName TEXT;");
+  const refcodeColumns = await db.all("PRAGMA table_info(refcodes)");
+  const refcodeNames = new Set(refcodeColumns.map((column) => column.name));
+  const refcodeAdds = [
+    ["owner_steamid64", "TEXT"],
+    ["created_utc", "TEXT"],
+    ["expires_utc", "TEXT"],
+    ["used_by_steamid64", "TEXT"],
+    ["used_utc", "TEXT"],
+    ["code_signature", "TEXT"]
+  ];
+  for (const [name, type] of refcodeAdds) {
+    if (!refcodeNames.has(name)) {
+      await db.exec(`ALTER TABLE refcodes ADD COLUMN ${name} ${type};`);
+    }
   }
-  if (!names.has("firstSeenAt")) {
-    await db.exec("ALTER TABLE referrals ADD COLUMN firstSeenAt TEXT;");
+
+  const playerColumns = await db.all("PRAGMA table_info(players)").catch(() => []);
+  if (playerColumns.length === 0) {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS players (
+        steamid64 TEXT PRIMARY KEY,
+        first_seen_utc TEXT NOT NULL
+      );
+    `);
   }
 }
 const STATUS_CACHE_TTL_MS = 10 * 1000;
@@ -1101,53 +922,45 @@ async function fetchServerStatus() {
 }
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
-app.get("/api/referrals/rules", (_req, res) => {
-  return res.status(200).json({
-    requiredVerified: REFERRAL_REQUIRED_VERIFIED,
-    requiredPlayHours: Math.floor(REFERRAL_VERIFY_THRESHOLD_SECONDS / 3600),
-    requiredAgeDays: REFERRAL_REQUIRED_AGE_DAYS,
-    reward: "$10 Steam Gift Card"
-  });
-});
-app.post("/api/refcode/issue", requirePluginToken, async (req, res) => {
+app.get("/health", (_req, res) => res.status(200).send("ok"));
+
+app.use("/api/referrals", requireReferralAuth);
+
+app.get("/api/refcode", requireReferralAuth, async (req, res) => {
   try {
-    const body = coerceBody(req);
-    const steamid64 = String(body?.steamid64 || "").trim();
-    const displayName = body?.displayName ? String(body.displayName).trim() : null;
+    const steamid64 = String(req.query?.steamid64 || "").trim();
     if (!isValidSteamId64(steamid64)) {
-      return res.status(400).json({ ok: false, error: "invalid_steamid64" });
-    }
-    if (isRefcodeIssueRateLimited(steamid64)) {
-      return res.status(429).json({ ok: false, error: "rate_limited" });
+      return sendError(res, 400, "invalid_steamid64");
     }
 
     const db = await dbPromise;
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
     await cleanupExpiredRefcodes(db, nowIso);
-    await db.run("DELETE FROM refcodes WHERE steamid64 = ?", steamid64);
 
     let code = "";
-    for (let attempt = 0; attempt < PORTAL_CODE_MAX_ATTEMPTS; attempt += 1) {
-      const candidate = generatePortalCode();
-      const existing = await db.get(
-        "SELECT code FROM refcodes WHERE code = ? AND expiresAt > ?",
+    const expiresAtIso = new Date(now + REF_CODE_TTL_MS).toISOString();
+    for (let attempt = 0; attempt < REF_CODE_MAX_ATTEMPTS; attempt += 1) {
+      const candidate = generateRefcode();
+      const active = await db.get(
+        `SELECT code FROM refcodes
+         WHERE code = ? AND used_utc IS NULL AND expires_utc > ?`,
         candidate,
         nowIso
       );
-      if (existing) {
+      if (active) {
         continue;
       }
-      const expiresAtIso = new Date(now + REF_CODE_TTL_MS).toISOString();
       try {
         await db.run(
-          "INSERT INTO refcodes (code, steamid64, displayName, expiresAt, issuedAt) VALUES (?, ?, ?, ?, ?)",
+          `INSERT INTO refcodes
+            (code, owner_steamid64, created_utc, expires_utc, used_by_steamid64, used_utc, code_signature)
+           VALUES (?, ?, ?, ?, NULL, NULL, ?)`,
           candidate,
           steamid64,
-          displayName,
+          nowIso,
           expiresAtIso,
-          nowIso
+          signRefcode(candidate)
         );
         code = candidate;
         break;
@@ -1160,69 +973,328 @@ app.post("/api/refcode/issue", requirePluginToken, async (req, res) => {
     }
 
     if (!code) {
-      return res.status(503).json({ ok: false, error: "code_generation_failed" });
+      return sendError(res, 503, "code_generation_failed");
     }
 
     return res.status(200).json({
+      ok: true,
       code,
-      expiresAt: new Date(now + REF_CODE_TTL_MS).toISOString()
+      expiresInSeconds: Math.floor(REF_CODE_TTL_MS / 1000)
     });
   } catch (err) {
     console.warn("Refcode issue error:", err?.message || err);
-    return res.status(500).json({ ok: false, error: "server_error" });
+    return sendError(res, 500, "server_error");
   }
 });
-app.post("/api/refcode/revoke", requirePluginToken, async (req, res) => {
+
+app.post("/api/referrals", async (req, res) => {
   try {
     const body = coerceBody(req);
-    const steamid64 = String(body?.steamid64 || "").trim();
-    if (!isValidSteamId64(steamid64)) {
-      return res.status(400).json({ ok: false, error: "invalid_steamid64" });
+    const referredId = String(body?.referredId || "").trim();
+    const referrerIdInput = String(body?.referrerId || "").trim();
+    const code = String(body?.code || "").trim();
+
+    if (!isValidSteamId64(referredId)) {
+      return sendError(res, 400, "invalid_referred_id");
     }
+    if (!code && !referrerIdInput) {
+      return sendError(res, 400, "missing_referrer");
+    }
+    if (code && !isValidRefcode(code)) {
+      return sendError(res, 400, "invalid_code");
+    }
+    if (referrerIdInput && !isValidSteamId64(referrerIdInput)) {
+      return sendError(res, 400, "invalid_referrer_id");
+    }
+
     const db = await dbPromise;
-    await db.run("DELETE FROM refcodes WHERE steamid64 = ?", steamid64);
+    const nowIso = new Date().toISOString();
+    await cleanupExpiredRefcodes(db, nowIso);
+
+    await db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = await db.get(
+        "SELECT id FROM referrals WHERE referred_steamid64 = ?",
+        referredId
+      );
+      if (existing) {
+        await db.exec("ROLLBACK");
+        return sendError(res, 409, "Referral already exists");
+      }
+
+      let referrerId = referrerIdInput;
+      if (code) {
+        const refcodeRow = await db.get(
+          `SELECT code, owner_steamid64, expires_utc, used_by_steamid64, used_utc, code_signature
+           FROM refcodes WHERE code = ?`,
+          code
+        );
+        if (!refcodeRow || refcodeRow.code_signature !== signRefcode(code)) {
+          await db.exec("ROLLBACK");
+          return sendError(res, 400, "invalid_or_expired_code");
+        }
+        const isExpired = refcodeRow.expires_utc <= nowIso;
+        if (refcodeRow.used_by_steamid64) {
+          await db.exec("ROLLBACK");
+          return sendError(res, 409, "code_already_used");
+        }
+        if (isExpired) {
+          await db.exec("ROLLBACK");
+          return sendError(res, 400, "invalid_or_expired_code");
+        }
+        referrerId = refcodeRow.owner_steamid64;
+        if (referrerIdInput && referrerIdInput !== referrerId) {
+          await db.exec("ROLLBACK");
+          return sendError(res, 400, "referrer_mismatch");
+        }
+        await db.run(
+          `UPDATE refcodes
+           SET used_by_steamid64 = ?, used_utc = ?
+           WHERE code = ?`,
+          referredId,
+          nowIso,
+          code
+        );
+      }
+
+      if (!isValidSteamId64(referrerId)) {
+        await db.exec("ROLLBACK");
+        return sendError(res, 400, "invalid_referrer_id");
+      }
+      if (referrerId === referredId) {
+        await db.exec("ROLLBACK");
+        return sendError(res, 400, "self_referral_not_allowed");
+      }
+
+      await db.run(
+        `INSERT INTO referrals
+          (referrer_steamid64, referred_steamid64, status, created_utc)
+         VALUES (?, ?, ?, ?)`,
+        referrerId,
+        referredId,
+        "pending",
+        nowIso
+      );
+
+      await db.exec("COMMIT");
+      return res.status(200).json({ ok: true, status: "pending" });
+    } catch (err) {
+      await db.exec("ROLLBACK");
+      if (String(err?.message || "").toLowerCase().includes("constraint")) {
+        return sendError(res, 409, "Referral already exists");
+      }
+      throw err;
+    }
+  } catch (err) {
+    console.warn("Referral create error:", err?.message || err);
+    return sendError(res, 500, "server_error");
+  }
+});
+
+app.post("/api/referrals/confirm", async (req, res) => {
+  try {
+    const body = coerceBody(req);
+    const referredId = String(body?.referredId || "").trim();
+    const code = String(body?.code || "").trim();
+    if (!isValidSteamId64(referredId)) {
+      return sendError(res, 400, "invalid_referred_id");
+    }
+    if (!isValidRefcode(code)) {
+      return sendError(res, 400, "invalid_code");
+    }
+
+    const db = await dbPromise;
+    const nowIso = new Date().toISOString();
+    await cleanupExpiredRefcodes(db, nowIso);
+
+    await db.exec("BEGIN IMMEDIATE");
+    try {
+      const referral = await db.get(
+        `SELECT id, status, referrer_steamid64, confirmed_utc
+         FROM referrals WHERE referred_steamid64 = ?`,
+        referredId
+      );
+      if (!referral) {
+        await db.exec("ROLLBACK");
+        return sendError(res, 404, "referral_not_found");
+      }
+
+      const refcodeRow = await db.get(
+        `SELECT code, owner_steamid64, expires_utc, used_by_steamid64, code_signature
+         FROM refcodes WHERE code = ?`,
+        code
+      );
+      if (!refcodeRow || refcodeRow.code_signature !== signRefcode(code)) {
+        await db.exec("ROLLBACK");
+        return sendError(res, 400, "invalid_or_expired_code");
+      }
+      if (refcodeRow.owner_steamid64 !== referral.referrer_steamid64) {
+        await db.exec("ROLLBACK");
+        return sendError(res, 400, "referrer_mismatch");
+      }
+      if (refcodeRow.used_by_steamid64 && refcodeRow.used_by_steamid64 !== referredId) {
+        await db.exec("ROLLBACK");
+        return sendError(res, 409, "code_already_used");
+      }
+      if (!refcodeRow.used_by_steamid64 && refcodeRow.expires_utc <= nowIso) {
+        await db.exec("ROLLBACK");
+        return sendError(res, 400, "invalid_or_expired_code");
+      }
+      if (!refcodeRow.used_by_steamid64) {
+        await db.run(
+          `UPDATE refcodes
+           SET used_by_steamid64 = ?, used_utc = ?
+           WHERE code = ?`,
+          referredId,
+          nowIso,
+          code
+        );
+      }
+
+      if (referral.status === "pending") {
+        await db.run(
+          `UPDATE referrals
+           SET status = ?, confirmed_utc = ?
+           WHERE id = ?`,
+          "confirmed",
+          nowIso,
+          referral.id
+        );
+      } else if (!referral.confirmed_utc) {
+        await db.run(
+          `UPDATE referrals
+           SET confirmed_utc = ?
+           WHERE id = ?`,
+          nowIso,
+          referral.id
+        );
+      }
+
+      await db.exec("COMMIT");
+      return res.status(200).json({ ok: true });
+    } catch (err) {
+      await db.exec("ROLLBACK");
+      throw err;
+    }
+  } catch (err) {
+    console.warn("Referral confirm error:", err?.message || err);
+    return sendError(res, 500, "server_error");
+  }
+});
+
+app.post("/api/referrals/verify", async (req, res) => {
+  try {
+    const body = coerceBody(req);
+    const referredId = String(body?.referredId || "").trim();
+    const totalPlaySeconds = body?.totalPlaySeconds;
+    const realPlaySeconds = body?.realPlaySeconds;
+    const firstSeenUtcInput = body?.firstSeenUtc ? String(body.firstSeenUtc).trim() : "";
+
+    if (!isValidSteamId64(referredId)) {
+      return sendError(res, 400, "invalid_referred_id");
+    }
+    if (totalPlaySeconds !== undefined && !Number.isFinite(Number(totalPlaySeconds))) {
+      return sendError(res, 400, "invalid_total_play_seconds");
+    }
+    if (realPlaySeconds !== undefined && !Number.isFinite(Number(realPlaySeconds))) {
+      return sendError(res, 400, "invalid_real_play_seconds");
+    }
+
+    const parsedFirstSeen = firstSeenUtcInput ? new Date(firstSeenUtcInput) : null;
+    const firstSeenIso =
+      parsedFirstSeen && !Number.isNaN(parsedFirstSeen.getTime())
+        ? parsedFirstSeen.toISOString()
+        : null;
+    if (firstSeenUtcInput && !firstSeenIso) {
+      return sendError(res, 400, "invalid_first_seen_utc");
+    }
+
+    const db = await dbPromise;
+    const nowIso = new Date().toISOString();
+    const referral = await db.get(
+      `SELECT id, status, first_seen_utc
+       FROM referrals WHERE referred_steamid64 = ?`,
+      referredId
+    );
+    if (!referral) {
+      return sendError(res, 404, "referral_not_found");
+    }
+
+    let nextFirstSeen = referral.first_seen_utc;
+    if (firstSeenIso) {
+      if (!nextFirstSeen || new Date(firstSeenIso) < new Date(nextFirstSeen)) {
+        nextFirstSeen = firstSeenIso;
+      }
+      await db.run(
+        `INSERT INTO players (steamid64, first_seen_utc)
+         VALUES (?, ?)
+         ON CONFLICT(steamid64) DO UPDATE SET
+           first_seen_utc = CASE
+             WHEN excluded.first_seen_utc < players.first_seen_utc
+             THEN excluded.first_seen_utc
+             ELSE players.first_seen_utc
+           END`,
+        referredId,
+        firstSeenIso
+      );
+    }
+
+    await db.run(
+      `UPDATE referrals
+       SET status = ?, verified_utc = ?,
+           total_play_seconds = ?, real_play_seconds = ?, first_seen_utc = ?
+       WHERE id = ?`,
+      "verified",
+      nowIso,
+      totalPlaySeconds !== undefined ? Math.floor(Number(totalPlaySeconds)) : null,
+      realPlaySeconds !== undefined ? Math.floor(Number(realPlaySeconds)) : null,
+      nextFirstSeen,
+      referral.id
+    );
+
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.warn("Refcode revoke error:", err?.message || err);
-    return res.status(500).json({ ok: false, error: "server_error" });
+    console.warn("Referral verify error:", err?.message || err);
+    return sendError(res, 500, "server_error");
   }
 });
-app.post("/api/refcode/consume", async (req, res) => {
-  if (isRefcodeConsumeRateLimited(req)) {
-    return res.status(429).json({ ok: false, message: "Too many attempts. Try again soon." });
-  }
 
+app.get("/api/referrals/status", async (req, res) => {
   try {
-    const body = coerceBody(req);
-    const code = normalizePortalCode(body?.code);
-    if (!isValidPortalCode(code)) {
-      return res.status(400).json({ ok: false, message: "Invalid or expired code" });
+    const steamid64 = String(req.query?.steamid64 || "").trim();
+    if (!isValidSteamId64(steamid64)) {
+      return sendError(res, 400, "invalid_steamid64");
     }
 
     const db = await dbPromise;
-    await cleanupExpiredRefcodes(db);
-    const refcodeRow = await consumeRefcode(db, code);
-    if (!refcodeRow) {
-      return res.status(400).json({ ok: false, message: "Invalid or expired code" });
-    }
+    const referralRows = await db.all(
+      `SELECT referred_steamid64, status, confirmed_utc, verified_utc
+       FROM referrals
+       WHERE referrer_steamid64 = ?
+       ORDER BY created_utc DESC`,
+      steamid64
+    );
+    const countRow = await db.get(
+      "SELECT COUNT(*) AS count FROM referrals WHERE referrer_steamid64 = ? AND status = 'verified'",
+      steamid64
+    );
+    const verifiedCount = Number(countRow?.count || 0);
 
-    let token;
-    try {
-      token = signSessionToken({ steamid64: refcodeRow.steamid64 });
-    } catch (err) {
-      return res.status(500).json({ ok: false, message: "Session token unavailable" });
-    }
-
-    const expiresAt = new Date(Date.now() + REF_CODE_SESSION_TTL_MS).toISOString();
     return res.status(200).json({
       ok: true,
-      steamid64: refcodeRow.steamid64,
-      token,
-      expiresAt
+      verifiedCount,
+      eligible: verifiedCount >= REFERRAL_REQUIRED_VERIFIED,
+      referrals: referralRows.map((row) => ({
+        referredId: row.referred_steamid64,
+        displayName: null,
+        status: row.status,
+        confirmedAt: row.confirmed_utc,
+        verifiedAt: row.verified_utc
+      }))
     });
   } catch (err) {
-    console.warn("Refcode consume error:", err?.message || err);
-    return res.status(500).json({ ok: false, message: "Server error" });
+    console.warn("Referral status error:", err?.message || err);
+    return sendError(res, 500, "server_error");
   }
 });
 app.get("/bestservers/postback", async (req, res) => {
@@ -1341,482 +1413,6 @@ app.get("/server/status", async (req, res) => {
     });
     writeStatusCache(payload);
     return res.status(200).json(payload);
-  }
-});
-app.post("/api/referrals/portal-code", requirePluginToken, async (req, res) => {
-  try {
-    const body = coerceBody(req);
-    const steamid64 = String(body?.steamid64 || "").trim();
-    if (!isValidSteamId64(steamid64)) {
-      return res.status(400).json({ ok: false, error: "invalid_steamid64" });
-    }
-
-    const db = await dbPromise;
-    const now = Date.now();
-    const nowIso = new Date(now).toISOString();
-    await cleanupExpiredPortalCodes(db, nowIso);
-
-    let code = "";
-    for (let attempt = 0; attempt < PORTAL_CODE_MAX_ATTEMPTS; attempt += 1) {
-      const candidate = generatePortalCode();
-      const existing = await db.get(
-        "SELECT code FROM portal_codes WHERE code = ? AND expiresAt > ?",
-        candidate,
-        nowIso
-      );
-      if (existing) {
-        continue;
-      }
-      const expiresAtIso = new Date(now + PORTAL_CODE_TTL_MS).toISOString();
-      try {
-        await db.run(
-          "INSERT INTO portal_codes (code, steamid64, expiresAt, createdAt) VALUES (?, ?, ?, ?)",
-          candidate,
-          steamid64,
-          expiresAtIso,
-          nowIso
-        );
-        code = candidate;
-        break;
-      } catch (err) {
-        if (String(err?.message || "").toLowerCase().includes("constraint")) {
-          continue;
-        }
-        throw err;
-      }
-    }
-
-    if (!code) {
-      return res.status(503).json({ ok: false, error: "code_generation_failed" });
-    }
-
-    return res.status(200).json({
-      ok: true,
-      code,
-      expiresInSeconds: Math.floor(PORTAL_CODE_TTL_MS / 1000)
-    });
-  } catch (err) {
-    console.warn("Portal code error:", err?.message || err);
-    return res.status(500).json({ ok: false, error: "server_error" });
-  }
-});
-app.get("/api/referrals/portal-status", async (req, res) => {
-  if (isPortalStatusRateLimited(req)) {
-    return res.status(429).json({ ok: false, error: "invalid_or_expired_code" });
-  }
-
-  try {
-    const code = normalizePortalCode(req.query?.code);
-    if (!isValidPortalCode(code)) {
-      return res.status(401).json({ ok: false, error: "invalid_or_expired_code" });
-    }
-
-    const db = await dbPromise;
-    await cleanupExpiredPortalCodes(db);
-    const portalRow = await consumePortalCode(db, code);
-    if (!portalRow) {
-      return res.status(401).json({ ok: false, error: "invalid_or_expired_code" });
-    }
-
-    const steamid64 = portalRow.steamid64;
-    const referralRows = await db.all(
-      `SELECT referrerId, referredId, status, confirmedAt, verifiedAt
-       FROM referrals WHERE referrerId = ?
-       ORDER BY createdAt DESC`,
-      steamid64
-    );
-    const countRow = await db.get(
-      "SELECT COUNT(*) AS count FROM referrals WHERE referrerId = ? AND status = 'verified'",
-      steamid64
-    );
-    const verifiedCount = Number(countRow?.count || 0);
-    const meta = await db.get(
-      "SELECT eligibleAt FROM referrer_meta WHERE referrerId = ?",
-      steamid64
-    );
-
-    return res.status(200).json({
-      ok: true,
-      steamid64,
-      verifiedCount,
-      required: REFERRAL_REQUIRED_VERIFIED,
-      eligible: Boolean(meta?.eligibleAt),
-      referrals: referralRows.map((row) => ({
-        referredId: row.referredId,
-        status: row.status,
-        confirmedAt: row.confirmedAt,
-        verifiedAt: row.verifiedAt
-      })),
-      playSeconds: null,
-      afkSeconds: null,
-      totalSeconds: null,
-      remainingSeconds: null
-    });
-  } catch (err) {
-    console.warn("Portal status error:", err?.message || err);
-    return res.status(500).json({ ok: false, error: "server_error" });
-  }
-});
-app.get("/api/referrals/me", requireSessionToken, async (req, res) => {
-  try {
-    const steamid64 = req.session?.steamid64;
-    const db = await dbPromise;
-    const referralRows = await db.all(
-      `SELECT referredId, status, confirmedAt, verifiedAt, playSecondsAtVerify, displayName, firstSeenAt, createdAt
-       FROM referrals WHERE referrerId = ?
-       ORDER BY createdAt DESC`,
-      steamid64
-    );
-    const countRow = await db.get(
-      "SELECT COUNT(*) AS count FROM referrals WHERE referrerId = ? AND status = 'verified'",
-      steamid64
-    );
-    const verifiedCount = Number(countRow?.count || 0);
-    const meta = await db.get(
-      "SELECT eligibleAt, paidAt FROM referrer_meta WHERE referrerId = ?",
-      steamid64
-    );
-    const eligibleAt = meta?.eligibleAt || null;
-    const paidAt = meta?.paidAt || null;
-
-    return res.status(200).json({
-      verifiedCount,
-      eligible: Boolean(eligibleAt),
-      eligibleAt,
-      paidAt,
-      referrals: referralRows.map((row) => ({
-        referredId: row.referredId,
-        displayName: row.displayName || null,
-        status: row.status,
-        confirmedAt: row.confirmedAt,
-        verifiedAt: row.verifiedAt,
-        playtimeHours: Number.isFinite(row.playSecondsAtVerify)
-          ? Math.round((row.playSecondsAtVerify / 3600) * 10) / 10
-          : null,
-        firstSeenAt: row.firstSeenAt || row.createdAt
-      }))
-    });
-  } catch (err) {
-    console.warn("Referrals me error:", err?.message || err);
-    return res.status(500).json({ ok: false, reason: "server_error" });
-  }
-});
-app.post("/api/referrals/request", async (req, res) => {
-  try {
-    const body = coerceBody(req);
-    const referrerId = String(body?.referrerId || "").trim();
-    const referredId = String(body?.referredId || "").trim();
-
-    if (!isValidSteamId64(referrerId) || !isValidSteamId64(referredId)) {
-      return res.status(400).json({ ok: false, reason: "invalid_steamid64" });
-    }
-    if (referrerId === referredId) {
-      return res.status(400).json({ ok: false, reason: "same_steamid64" });
-    }
-
-    const db = await dbPromise;
-    const existing = await db.get(
-      "SELECT id FROM referrals WHERE referredId = ?",
-      referredId
-    );
-    if (existing) {
-      return res.status(409).json({ ok: false, reason: "referred_exists" });
-    }
-
-    let code = "";
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      const candidate = generateReferralCode();
-      const codeTaken = await db.get(
-        "SELECT id FROM referrals WHERE code = ?",
-        candidate
-      );
-      if (!codeTaken) {
-        code = candidate;
-        break;
-      }
-    }
-    if (!code) {
-      return res.status(500).json({ ok: false, reason: "code_generation_failed" });
-    }
-
-    const createdAt = new Date().toISOString();
-    await db.run(
-      `INSERT INTO referrals
-        (referrerId, referredId, code, status, createdAt)
-       VALUES (?, ?, ?, ?, ?)`,
-      referrerId,
-      referredId,
-      code,
-      "pending",
-      createdAt
-    );
-
-    return res.status(200).json({ ok: true, code });
-  } catch (err) {
-    console.warn("Referral request error:", err?.message || err);
-    return res.status(500).json({ ok: false, reason: "server_error" });
-  }
-});
-app.post("/api/referrals/accept", requirePluginToken, async (req, res) => {
-  try {
-    const body = coerceBody(req);
-    const referrerId = String(body?.referrerId || "").trim();
-    const referredId = String(body?.referredId || "").trim();
-    const code = normalizeReferralCode(body?.code);
-    const acceptedBy = String(body?.acceptedBy || "").trim();
-    const displayName = body?.displayName ? String(body.displayName).trim() : null;
-
-    if (!isValidSteamId64(referredId)) {
-      return res.status(400).json({ ok: false, reason: "invalid_referred_id" });
-    }
-    if (referrerId && !isValidSteamId64(referrerId)) {
-      return res.status(400).json({ ok: false, reason: "invalid_referrer_id" });
-    }
-    if (code && !/^[A-Z0-9]{6}$/.test(code)) {
-      return res.status(400).json({ ok: false, reason: "invalid_code" });
-    }
-    if (acceptedBy && acceptedBy !== "referred") {
-      return res.status(400).json({ ok: false, reason: "invalid_accepted_by" });
-    }
-
-    const db = await dbPromise;
-    const referral = await db.get(
-      `SELECT id, status
-       FROM referrals
-       WHERE referredId = ?
-         AND (? = '' OR referrerId = ?)
-         AND (? = '' OR code = ?)`,
-      referredId,
-      referrerId,
-      referrerId,
-      code,
-      code
-    );
-    if (!referral) {
-      return res.status(404).json({ ok: false, reason: "not_found" });
-    }
-    if (referral.status === "pending") {
-      await db.run(
-        "UPDATE referrals SET status = ?, confirmedAt = ?, displayName = COALESCE(displayName, ?) WHERE id = ?",
-        "confirmed",
-        new Date().toISOString(),
-        displayName,
-        referral.id
-      );
-    } else if (displayName) {
-      await db.run(
-        "UPDATE referrals SET displayName = COALESCE(displayName, ?) WHERE id = ?",
-        displayName,
-        referral.id
-      );
-    }
-
-    return res.status(200).json({ ok: true, status: referral.status === "pending" ? "confirmed" : referral.status });
-  } catch (err) {
-    console.warn("Referral accept error:", err?.message || err);
-    return res.status(500).json({ ok: false, reason: "server_error" });
-  }
-});
-app.post("/api/referrals/confirm", requirePluginToken, async (req, res) => {
-  try {
-    const body = coerceBody(req);
-    const referredId = String(body?.referredId || "").trim();
-    const code = normalizeReferralCode(body?.code);
-
-    if (!isValidSteamId64(referredId)) {
-      return res.status(400).json({ ok: false, reason: "invalid_steamid64" });
-    }
-    if (!/^[A-Z0-9]{6}$/.test(code)) {
-      return res.status(400).json({ ok: false, reason: "invalid_code" });
-    }
-
-    const db = await dbPromise;
-    const referral = await db.get(
-      "SELECT id, status FROM referrals WHERE referredId = ? AND code = ?",
-      referredId,
-      code
-    );
-    if (!referral) {
-      return res.status(404).json({ ok: false, reason: "not_found" });
-    }
-    if (referral.status !== "pending") {
-      return res.status(409).json({
-        ok: false,
-        reason: "not_pending",
-        status: referral.status
-      });
-    }
-
-    await db.run(
-      "UPDATE referrals SET status = ?, confirmedAt = ? WHERE id = ?",
-      "confirmed",
-      new Date().toISOString(),
-      referral.id
-    );
-
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.warn("Referral confirm error:", err?.message || err);
-    return res.status(500).json({ ok: false, reason: "server_error" });
-  }
-});
-app.post("/api/referrals/verify", requirePluginToken, async (req, res) => {
-  try {
-    const body = coerceBody(req);
-    const referredId = String(body?.referredId || "").trim();
-    const totalPlaySeconds = Number(body?.totalPlaySeconds);
-    const firstSeenAtInput = body?.firstSeenAt ? String(body.firstSeenAt).trim() : "";
-
-    if (!isValidSteamId64(referredId)) {
-      return res.status(400).json({ ok: false, reason: "invalid_steamid64" });
-    }
-    if (!Number.isFinite(totalPlaySeconds) || totalPlaySeconds < 0) {
-      return res.status(400).json({ ok: false, reason: "invalid_playtime" });
-    }
-
-    const db = await dbPromise;
-    const referral = await db.get(
-      "SELECT * FROM referrals WHERE referredId = ?",
-      referredId
-    );
-    if (!referral) {
-      return res.status(404).json({ ok: false, reason: "not_found" });
-    }
-
-    let status = referral.status;
-    const parsedFirstSeen = firstSeenAtInput ? new Date(firstSeenAtInput) : null;
-    const storedFirstSeen = referral.firstSeenAt ? new Date(referral.firstSeenAt) : null;
-    const firstSeenAt = parsedFirstSeen && !Number.isNaN(parsedFirstSeen.getTime())
-      ? parsedFirstSeen
-      : storedFirstSeen;
-    const meetsPlaytime = totalPlaySeconds >= REFERRAL_VERIFY_THRESHOLD_SECONDS;
-    const meetsAge =
-      firstSeenAt && Date.now() - firstSeenAt.getTime() >= REFERRAL_REQUIRED_AGE_DAYS * 24 * 60 * 60 * 1000;
-    const canVerify = status === "confirmed" || status === "verified";
-
-    if (parsedFirstSeen && !Number.isNaN(parsedFirstSeen.getTime())) {
-      await db.run(
-        "UPDATE referrals SET firstSeenAt = COALESCE(firstSeenAt, ?) WHERE id = ?",
-        parsedFirstSeen.toISOString(),
-        referral.id
-      );
-    }
-
-    if (canVerify && meetsPlaytime && meetsAge && referral.status !== "verified") {
-      await db.run(
-        `UPDATE referrals
-         SET status = ?, verifiedAt = ?, playSecondsAtVerify = ?
-         WHERE id = ?`,
-        "verified",
-        new Date().toISOString(),
-        Math.floor(totalPlaySeconds),
-        referral.id
-      );
-      status = "verified";
-    }
-
-    const countRow = await db.get(
-      "SELECT COUNT(*) AS count FROM referrals WHERE referrerId = ? AND status = 'verified'",
-      referral.referrerId
-    );
-    const verifiedCount = Number(countRow?.count || 0);
-    const meta = await db.get(
-      "SELECT eligibleAt, paidAt FROM referrer_meta WHERE referrerId = ?",
-      referral.referrerId
-    );
-    const existingEligibleAt = meta?.eligibleAt || null;
-    const nextEligibleAt =
-      verifiedCount >= REFERRAL_REQUIRED_VERIFIED && !existingEligibleAt
-        ? new Date().toISOString()
-        : existingEligibleAt;
-    const paidAt = meta?.paidAt || null;
-
-    await db.run(
-      `INSERT INTO referrer_meta (referrerId, verifiedCount, eligibleAt, paidAt)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(referrerId) DO UPDATE SET
-         verifiedCount = excluded.verifiedCount,
-         eligibleAt = COALESCE(referrer_meta.eligibleAt, excluded.eligibleAt),
-         paidAt = referrer_meta.paidAt`,
-      referral.referrerId,
-      verifiedCount,
-      nextEligibleAt,
-      paidAt
-    );
-
-    return res.status(200).json({
-      ok: true,
-      status,
-      verifiedCount,
-      eligible: Boolean(nextEligibleAt),
-      meetsPlaytime,
-      meetsAge,
-      firstSeenAt: firstSeenAt ? firstSeenAt.toISOString() : null
-    });
-  } catch (err) {
-    console.warn("Referral verify error:", err?.message || err);
-    return res.status(500).json({ ok: false, reason: "server_error" });
-  }
-});
-app.get("/api/referrals/status", async (req, res) => {
-  try {
-    const steamid64 = pickFirst(req.query, ["steamid64"]);
-    if (!isValidSteamId64(steamid64)) {
-      return res.status(400).json({ ok: false, reason: "invalid_steamid64" });
-    }
-
-    const db = await dbPromise;
-    const referrerRows = await db.all(
-      `SELECT referrerId, referredId, code, status, confirmedAt, verifiedAt, playSecondsAtVerify, createdAt
-       FROM referrals WHERE referrerId = ?
-       ORDER BY createdAt DESC`,
-      steamid64
-    );
-    let role = "";
-    let referrals = [];
-    let referrerId = "";
-
-    if (referrerRows.length > 0) {
-      role = "referrer";
-      referrals = referrerRows;
-      referrerId = steamid64;
-    } else {
-      const referredRow = await db.get(
-        `SELECT referrerId, referredId, code, status, confirmedAt, verifiedAt, playSecondsAtVerify, createdAt
-         FROM referrals WHERE referredId = ?`,
-        steamid64
-      );
-      if (!referredRow) {
-        return res.status(404).json({ ok: false, reason: "not_found" });
-      }
-      role = "referred";
-      referrals = [referredRow];
-      referrerId = referredRow.referrerId;
-    }
-
-    const countRow = await db.get(
-      "SELECT COUNT(*) AS count FROM referrals WHERE referrerId = ? AND status = 'verified'",
-      referrerId
-    );
-    const verifiedCount = Number(countRow?.count || 0);
-    const meta = await db.get(
-      "SELECT eligibleAt, paidAt FROM referrer_meta WHERE referrerId = ?",
-      referrerId
-    );
-
-    return res.status(200).json({
-      ok: true,
-      role,
-      verifiedCount,
-      required: REFERRAL_REQUIRED_VERIFIED,
-      eligible: Boolean(meta?.eligibleAt),
-      eligibleAt: meta?.eligibleAt || null,
-      paidAt: meta?.paidAt || null,
-      referrals
-    });
-  } catch (err) {
-    console.warn("Referral status error:", err?.message || err);
-    return res.status(500).json({ ok: false, reason: "server_error" });
   }
 });
 app.get("/debug/test-discord", async (req, res) => {
@@ -2212,18 +1808,10 @@ setInterval(() => {
   processExpiredEntitlements().catch((err) => {
     console.error("Failed to process expired entitlements:", err);
   });
-  processExpiredPortalCodes().catch((err) => {
-    console.error("Failed to process expired portal codes:", err);
-  });
   processExpiredRefcodes().catch((err) => {
     console.error("Failed to process expired refcodes:", err);
   });
 }, 60 * 1000);
-
-async function processExpiredPortalCodes() {
-  const db = await dbPromise;
-  await cleanupExpiredPortalCodes(db);
-}
 
 async function processExpiredRefcodes() {
   const db = await dbPromise;
