@@ -12,6 +12,7 @@ This service receives Tranzila notify calls and grants VIP via Rust RCON. It sup
 | `RCON_PORT` | yes | Rust RCON port. |
 | `RCON_PASSWORD` | yes | Rust RCON password. |
 | `BESTSERVERS_SERVERKEY` | yes | BestServers API server key for vote claim verification. |
+| `REFERRAL_SERVER_SECRET` | yes | Shared secret for referral server-to-backend calls. |
 | `DB_PATH` | no | SQLite path (defaults to `./data.sqlite`). |
 | `DISCORD_WEBHOOK_URL` | no | Discord webhook for notifications (preferred). |
 | `DISCORD_WEBHOOK` | no | Alias for `DISCORD_WEBHOOK_URL`. |
@@ -97,6 +98,16 @@ Manual test example:
 ```
 https://railway-production-9e24.up.railway.app/bestservers/postback?username=76561198000000000&userip=127.0.0.1
 ```
+
+## Referral system
+
+The referral system supports a friend-brings-friend program. The backend is the source of truth, and server-to-backend calls must include `Authorization: Bearer $REFERRAL_SERVER_SECRET`.
+
+Flow overview:
+1. Website calls `POST /api/referrals/request` with `{ referrerId, referredId }` to create a pending referral and receive a 6-character code.
+2. Trusted server calls `POST /api/referrals/confirm` with `{ referredId, code }` to confirm the referral.
+3. Trusted server calls `POST /api/referrals/verify` with `{ referredId, totalPlaySeconds }` to mark verified once playtime is at least 86,400 seconds.
+4. `GET /api/referrals/status?steamid64=...` returns referrer/referred status, verification counts, and eligibility (eligible at 5 verified referrals).
 
 ## Local test commands
 
