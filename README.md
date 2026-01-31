@@ -12,7 +12,10 @@ This service receives Tranzila notify calls and grants VIP via Rust RCON. It sup
 | `RCON_PORT` | yes | Rust RCON port. |
 | `RCON_PASSWORD` | yes | Rust RCON password. |
 | `BESTSERVERS_SERVERKEY` | yes | BestServers API server key for vote claim verification. |
-| `REFERRAL_SERVER_SECRET` | yes | Shared secret for referral server-to-backend calls. |
+| `REFERRAL_API_TOKEN` | yes | Shared bearer token for referral plugin → backend calls (preferred). |
+| `REFERRAL_SERVER_SECRET` | yes | Legacy shared secret for referral server-to-backend calls (fallback if `REFERRAL_API_TOKEN` is unset). |
+| `SESSION_SIGNING_SECRET` | yes | HMAC secret for short-lived refcode session JWTs (preferred). |
+| `REFCODE_SESSION_SECRET` | no | Legacy alias for `SESSION_SIGNING_SECRET`. |
 | `DB_PATH` | no | SQLite path (defaults to `./data.sqlite`). |
 | `DISCORD_WEBHOOK_URL` | no | Discord webhook for notifications (preferred). |
 | `DISCORD_WEBHOOK` | no | Alias for `DISCORD_WEBHOOK_URL`. |
@@ -101,13 +104,27 @@ https://railway-production-9e24.up.railway.app/bestservers/postback?username=765
 
 ## Referral system
 
-The referral system supports a friend-brings-friend program. The backend is the source of truth, and server-to-backend calls must include `Authorization: Bearer $REFERRAL_SERVER_SECRET`.
+The referral system supports a friend-brings-friend program. The backend is the source of truth, and plugin calls must include `Authorization: Bearer $REFERRAL_API_TOKEN` (or the legacy `REFERRAL_SERVER_SECRET`).
+
+Rules summary:
+- 5 verified referrals required.
+- Each referred player needs >= 24 hours playtime and >= 7 days since first join.
+- Verification requires mutual acceptance (referred confirms).
+- Reward: $10 Steam Gift Card.
 
 Flow overview:
 1. Website calls `POST /api/referrals/request` with `{ referrerId, referredId }` to create a pending referral and receive a 6-character code.
-2. Trusted server calls `POST /api/referrals/confirm` with `{ referredId, code }` to confirm the referral.
-3. Trusted server calls `POST /api/referrals/verify` with `{ referredId, totalPlaySeconds }` to mark verified once playtime is at least 86,400 seconds.
+2. Trusted server calls `POST /api/referrals/accept` with `{ referrerId, referredId, acceptedBy: "referred" }` (or `{ referredId, code }`) to confirm the referral.
+3. Trusted server calls `POST /api/referrals/verify` with `{ referredId, totalPlaySeconds, firstSeenAt }` to mark verified once playtime is at least 86,400 seconds and first join was at least 7 days ago.
 4. `GET /api/referrals/status?steamid64=...` returns referrer/referred status, verification counts, and eligibility (eligible at 5 verified referrals).
+
+### Ref Dashboard without Steam login (refcode flow)
+
+1. Plugin issues a short-lived 4-digit code:
+`POST /api/refcode/issue` with `{ steamid64, displayName }` (expires in 5 minutes).
+2. Website consumes the code (no secrets) via `POST /api/refcode/consume` and receives a short-lived session token (10 minutes).
+3. Website calls `GET /api/referrals/me` with `Authorization: Bearer <token>` to fetch status for the logged-in player.
+4. Website can fetch rules from `GET /api/referrals/rules`.
 
 ## Local test commands
 
@@ -216,6 +233,42 @@ curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
     "custom2": "vip_30d",
     "ConfirmationCode": "tx-vip-1"
   }'
+```
+
+## Refcode flow (curl)
+
+### Issue a refcode (plugin)
+```bash
+curl -X POST "http://localhost:8080/api/refcode/issue" \
+  -H "Authorization: Bearer $REFERRAL_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"steamid64":"76561198000000000","displayName":"Referrer"}'
+```
+
+### Consume refcode (website)
+```bash
+curl -X POST "http://localhost:8080/api/refcode/consume" \
+  -H "Content-Type: application/json" \
+  -d '{"code":"1234"}'
+```
+
+### Fetch referral status (website)
+```bash
+curl -X GET "http://localhost:8080/api/referrals/me" \
+  -H "Authorization: Bearer <SESSION_TOKEN>"
+```
+
+### Accept + verify referral (plugin)
+```bash
+curl -X POST "http://localhost:8080/api/referrals/accept" \
+  -H "Authorization: Bearer $REFERRAL_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"referrerId":"76561198000000000","referredId":"76561198000000001","acceptedBy":"referred"}'
+
+curl -X POST "http://localhost:8080/api/referrals/verify" \
+  -H "Authorization: Bearer $REFERRAL_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"referredId":"76561198000000001","totalPlaySeconds":90000,"firstSeenAt":"2024-01-01T00:00:00.000Z"}'
 ```
 
 ## Server status endpoint
