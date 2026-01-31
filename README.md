@@ -12,10 +12,10 @@ This service receives Tranzila notify calls and grants VIP via Rust RCON. It sup
 | `RCON_PORT` | yes | Rust RCON port. |
 | `RCON_PASSWORD` | yes | Rust RCON password. |
 | `BESTSERVERS_SERVERKEY` | yes | BestServers API server key for vote claim verification. |
-| `REFERRAL_API_TOKEN` | yes | Shared bearer token for referral plugin → backend calls (preferred). |
-| `REFERRAL_SERVER_SECRET` | yes | Legacy shared secret for referral server-to-backend calls (fallback if `REFERRAL_API_TOKEN` is unset). |
-| `SESSION_SIGNING_SECRET` | yes | HMAC secret for short-lived refcode session JWTs (preferred). |
-| `REFCODE_SESSION_SECRET` | no | Legacy alias for `SESSION_SIGNING_SECRET`. |
+| `REFERRAL_SERVER_SECRET` | yes | Shared bearer token for referral plugin → backend calls. |
+| `REFERRAL_SESSION_SECRET` | yes | HMAC secret for short-lived refcode session JWTs. |
+| `REFCODE_TTL_SECONDS` | no | Refcode TTL in seconds (defaults to `600`). |
+| `SESSION_TTL_SECONDS` | no | Session token TTL in seconds (defaults to `600`). |
 | `DB_PATH` | no | SQLite path (defaults to `./data.sqlite`). |
 | `DISCORD_WEBHOOK_URL` | no | Discord webhook for notifications (preferred). |
 | `DISCORD_WEBHOOK` | no | Alias for `DISCORD_WEBHOOK_URL`. |
@@ -102,29 +102,15 @@ Manual test example:
 https://railway-production-9e24.up.railway.app/bestservers/postback?username=76561198000000000&userip=127.0.0.1
 ```
 
-## Referral system
+## Referral system (code-only dashboard)
 
-The referral system supports a friend-brings-friend program. The backend is the source of truth, and plugin calls must include `Authorization: Bearer $REFERRAL_API_TOKEN` (or the legacy `REFERRAL_SERVER_SECRET`).
-
-Rules summary:
-- 5 verified referrals required.
-- Each referred player needs >= 24 hours playtime and >= 7 days since first join.
-- Verification requires mutual acceptance (referred confirms).
-- Reward: $10 Steam Gift Card.
+The referral dashboard flow uses a short-lived 4-digit code and a short-lived session token. Website traffic never provides Steam IDs or Steam login.
 
 Flow overview:
-1. Website calls `POST /api/referrals/request` with `{ referrerId, referredId }` to create a pending referral and receive a 6-character code.
-2. Trusted server calls `POST /api/referrals/accept` with `{ referrerId, referredId, acceptedBy: "referred" }` (or `{ referredId, code }`) to confirm the referral.
-3. Trusted server calls `POST /api/referrals/verify` with `{ referredId, totalPlaySeconds, firstSeenAt }` to mark verified once playtime is at least 86,400 seconds and first join was at least 7 days ago.
-4. `GET /api/referrals/status?steamid64=...` returns referrer/referred status, verification counts, and eligibility (eligible at 5 verified referrals).
-
-### Ref Dashboard without Steam login (refcode flow)
-
-1. Plugin issues a short-lived 4-digit code:
-`POST /api/refcode/issue` with `{ steamid64, displayName }` (expires in 5 minutes).
-2. Website consumes the code (no secrets) via `POST /api/refcode/consume` and receives a short-lived session token (10 minutes).
+1. Plugin issues a short-lived 4-digit code with `POST /api/refcode/issue` using `Authorization: Bearer $REFERRAL_SERVER_SECRET`.
+2. Website consumes the code via `POST /api/refcode/consume` and receives a short-lived session token.
 3. Website calls `GET /api/referrals/me` with `Authorization: Bearer <token>` to fetch status for the logged-in player.
-4. Website can fetch rules from `GET /api/referrals/rules`.
+4. Trusted server can query `GET /api/referrals/status?steamid64=...` with `Authorization: Bearer $REFERRAL_SERVER_SECRET` for server-only checks.
 
 ## Local test commands
 
@@ -240,7 +226,7 @@ curl -X POST "http://localhost:8080/tranzila/notify?token=YOUR_SECRET" \
 ### Issue a refcode (plugin)
 ```bash
 curl -X POST "http://localhost:8080/api/refcode/issue" \
-  -H "Authorization: Bearer $REFERRAL_API_TOKEN" \
+  -H "Authorization: Bearer $REFERRAL_SERVER_SECRET" \
   -H "Content-Type: application/json" \
   -d '{"steamid64":"76561198000000000","displayName":"Referrer"}'
 ```
@@ -258,15 +244,15 @@ curl -X GET "http://localhost:8080/api/referrals/me" \
   -H "Authorization: Bearer <SESSION_TOKEN>"
 ```
 
-### Accept + verify referral (plugin)
+### Confirm + verify referral (plugin)
 ```bash
-curl -X POST "http://localhost:8080/api/referrals/accept" \
-  -H "Authorization: Bearer $REFERRAL_API_TOKEN" \
+curl -X POST "http://localhost:8080/api/referrals/confirm" \
+  -H "Authorization: Bearer $REFERRAL_SERVER_SECRET" \
   -H "Content-Type: application/json" \
-  -d '{"referrerId":"76561198000000000","referredId":"76561198000000001","acceptedBy":"referred"}'
+  -d '{"referredId":"76561198000000001","code":"1234"}'
 
 curl -X POST "http://localhost:8080/api/referrals/verify" \
-  -H "Authorization: Bearer $REFERRAL_API_TOKEN" \
+  -H "Authorization: Bearer $REFERRAL_SERVER_SECRET" \
   -H "Content-Type: application/json" \
   -d '{"referredId":"76561198000000001","totalPlaySeconds":90000,"firstSeenAt":"2024-01-01T00:00:00.000Z"}'
 ```
