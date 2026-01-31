@@ -52,7 +52,9 @@ const {
   TRAZNILA_NOTIFY_SECRET,
   BESTSERVERS_SERVERKEY,
   REFERRAL_SERVER_SECRET,
-  REFCODE_SESSION_SECRET,
+  REFERRAL_SESSION_SECRET,
+  REFCODE_TTL_SECONDS,
+  SESSION_TTL_SECONDS,
   PORT
 } = process.env;
 
@@ -65,7 +67,9 @@ function required(name, value) {
 required("API_SECRET", API_SECRET);
 required("BESTSERVERS_SERVERKEY", BESTSERVERS_SERVERKEY);
 required("REFERRAL_SERVER_SECRET", REFERRAL_SERVER_SECRET);
-required("REFCODE_SESSION_SECRET", REFCODE_SESSION_SECRET);
+const referralSessionSecret =
+  REFERRAL_SESSION_SECRET || process.env.REFCODE_SESSION_SECRET || "";
+required("REFERRAL_SESSION_SECRET", referralSessionSecret);
 const isDryRun = DRY_RUN.toLowerCase() === "true";
 const isRconConfigured = !!(RCON_HOST && RCON_PORT && RCON_PASSWORD);
 const DISCORD_WEBHOOK_KEYS = [
@@ -534,8 +538,26 @@ function markBestserversCooldown(steamid64, now = Date.now()) {
 
 const REFERRAL_REQUIRED_VERIFIED = 5;
 const REF_CODE_LENGTH = 4;
-const REF_CODE_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_REF_CODE_TTL_SECONDS = 600;
+const DEFAULT_SESSION_TTL_SECONDS = 600;
+const REF_CODE_TTL_MS = resolveSeconds(REFCODE_TTL_SECONDS, DEFAULT_REF_CODE_TTL_SECONDS) * 1000;
+const SESSION_TTL_SECONDS_VALUE = resolveSeconds(
+  SESSION_TTL_SECONDS,
+  DEFAULT_SESSION_TTL_SECONDS
+);
 const REF_CODE_MAX_ATTEMPTS = 20;
+const ISSUE_RATE_LIMIT_MS = 15 * 1000;
+const CONSUME_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const CONSUME_RATE_LIMIT_MAX = 5;
+
+const issueRateLimit = new Map();
+const consumeRateLimit = new Map();
+
+function resolveSeconds(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 function isValidSteamId64(value) {
   return /^\d{17}$/.test(String(value || "").trim());
@@ -552,9 +574,91 @@ function isValidRefcode(value) {
 
 function signRefcode(code) {
   return crypto
-    .createHmac("sha256", REFCODE_SESSION_SECRET)
+    .createHmac("sha256", referralSessionSecret)
     .update(code)
     .digest("hex");
+}
+
+function base64UrlEncode(input) {
+  return Buffer.from(input).toString("base64url");
+}
+
+function base64UrlEncodeJson(payload) {
+  return base64UrlEncode(JSON.stringify(payload));
+}
+
+function signJwt(payload) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const headerEncoded = base64UrlEncodeJson(header);
+  const payloadEncoded = base64UrlEncodeJson(payload);
+  const data = `${headerEncoded}.${payloadEncoded}`;
+  const signature = crypto
+    .createHmac("sha256", referralSessionSecret)
+    .update(data)
+    .digest("base64url");
+  return `${data}.${signature}`;
+}
+
+function verifyJwt(token) {
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [headerEncoded, payloadEncoded, signature] = parts;
+  const data = `${headerEncoded}.${payloadEncoded}`;
+  const expected = crypto
+    .createHmac("sha256", referralSessionSecret)
+    .update(data)
+    .digest("base64url");
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(Buffer.from(payloadEncoded, "base64url").toString("utf8"));
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (!payload || typeof payload !== "object") return null;
+    if (!payload.exp || nowSeconds >= payload.exp) return null;
+    return payload;
+  } catch (err) {
+    return null;
+  }
+}
+
+function createSessionToken(steamid64) {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  return signJwt({
+    sub: steamid64,
+    steamid64,
+    iat: nowSeconds,
+    exp: nowSeconds + SESSION_TTL_SECONDS_VALUE
+  });
+}
+
+function getClientIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  if (forwarded) return forwarded;
+  return req.ip || "";
+}
+
+function isIssueRateLimited(steamid64) {
+  const now = Date.now();
+  const lastIssued = issueRateLimit.get(steamid64);
+  if (lastIssued && now - lastIssued < ISSUE_RATE_LIMIT_MS) return true;
+  issueRateLimit.set(steamid64, now);
+  return false;
+}
+
+function registerConsumeAttempt(ip) {
+  const now = Date.now();
+  const windowStart = now - CONSUME_RATE_LIMIT_WINDOW_MS;
+  const attempts = consumeRateLimit.get(ip) || [];
+  const recent = attempts.filter((timestamp) => timestamp >= windowStart);
+  recent.push(now);
+  consumeRateLimit.set(ip, recent);
+  return recent.length <= CONSUME_RATE_LIMIT_MAX;
 }
 
 function getReferralAuthToken(req) {
@@ -922,13 +1026,14 @@ async function fetchServerStatus() {
 }
 
 app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+app.get("/health", (_req, res) =>
+  res.status(200).json({ ok: true, service: "loverust-referrals" })
+);
 
-app.use("/api/referrals", requireReferralAuth);
-
-app.get("/api/refcode", requireReferralAuth, async (req, res) => {
+app.post("/api/refcode/issue", requireReferralAuth, async (req, res) => {
   try {
-    const steamid64 = String(req.query?.steamid64 || "").trim();
+    const body = coerceBody(req);
+    const steamid64 = String(body?.steamid64 || "").trim();
     if (!isValidSteamId64(steamid64)) {
       return sendError(res, 400, "invalid_steamid64");
     }
@@ -937,6 +1042,27 @@ app.get("/api/refcode", requireReferralAuth, async (req, res) => {
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
     await cleanupExpiredRefcodes(db, nowIso);
+
+    const existing = await db.get(
+      `SELECT code, expires_utc
+       FROM refcodes
+       WHERE owner_steamid64 = ? AND used_utc IS NULL AND expires_utc > ?
+       ORDER BY created_utc DESC
+       LIMIT 1`,
+      steamid64,
+      nowIso
+    );
+    if (existing) {
+      return res.status(200).json({
+        code: existing.code,
+        expiresAt: existing.expires_utc,
+        expiresIn: Math.max(0, Math.floor((Date.parse(existing.expires_utc) - now) / 1000))
+      });
+    }
+
+    if (isIssueRateLimited(steamid64)) {
+      return sendError(res, 429, "rate_limited");
+    }
 
     let code = "";
     const expiresAtIso = new Date(now + REF_CODE_TTL_MS).toISOString();
@@ -977,9 +1103,9 @@ app.get("/api/refcode", requireReferralAuth, async (req, res) => {
     }
 
     return res.status(200).json({
-      ok: true,
       code,
-      expiresInSeconds: Math.floor(REF_CODE_TTL_MS / 1000)
+      expiresAt: expiresAtIso,
+      expiresIn: Math.floor(REF_CODE_TTL_MS / 1000)
     });
   } catch (err) {
     console.warn("Refcode issue error:", err?.message || err);
@@ -987,24 +1113,17 @@ app.get("/api/refcode", requireReferralAuth, async (req, res) => {
   }
 });
 
-app.post("/api/referrals", async (req, res) => {
+app.post("/api/refcode/consume", async (req, res) => {
   try {
     const body = coerceBody(req);
-    const referredId = String(body?.referredId || "").trim();
-    const referrerIdInput = String(body?.referrerId || "").trim();
     const code = String(body?.code || "").trim();
-
-    if (!isValidSteamId64(referredId)) {
-      return sendError(res, 400, "invalid_referred_id");
-    }
-    if (!code && !referrerIdInput) {
-      return sendError(res, 400, "missing_referrer");
-    }
     if (code && !isValidRefcode(code)) {
       return sendError(res, 400, "invalid_code");
     }
-    if (referrerIdInput && !isValidSteamId64(referrerIdInput)) {
-      return sendError(res, 400, "invalid_referrer_id");
+
+    const ip = getClientIp(req);
+    if (!registerConsumeAttempt(ip)) {
+      return sendError(res, 429, "rate_limited");
     }
 
     const db = await dbPromise;
@@ -1013,85 +1132,93 @@ app.post("/api/referrals", async (req, res) => {
 
     await db.exec("BEGIN IMMEDIATE");
     try {
-      const existing = await db.get(
-        "SELECT id FROM referrals WHERE referred_steamid64 = ?",
-        referredId
+      const refcodeRow = await db.get(
+        `SELECT code, owner_steamid64, expires_utc, used_by_steamid64, code_signature
+         FROM refcodes WHERE code = ?`,
+        code
       );
-      if (existing) {
+      if (!refcodeRow || refcodeRow.code_signature !== signRefcode(code)) {
         await db.exec("ROLLBACK");
-        return sendError(res, 409, "Referral already exists");
+        return sendError(res, 400, "invalid_code");
       }
-
-      let referrerId = referrerIdInput;
-      if (code) {
-        const refcodeRow = await db.get(
-          `SELECT code, owner_steamid64, expires_utc, used_by_steamid64, used_utc, code_signature
-           FROM refcodes WHERE code = ?`,
-          code
-        );
-        if (!refcodeRow || refcodeRow.code_signature !== signRefcode(code)) {
-          await db.exec("ROLLBACK");
-          return sendError(res, 400, "invalid_or_expired_code");
-        }
-        const isExpired = refcodeRow.expires_utc <= nowIso;
-        if (refcodeRow.used_by_steamid64) {
-          await db.exec("ROLLBACK");
-          return sendError(res, 409, "code_already_used");
-        }
-        if (isExpired) {
-          await db.exec("ROLLBACK");
-          return sendError(res, 400, "invalid_or_expired_code");
-        }
-        referrerId = refcodeRow.owner_steamid64;
-        if (referrerIdInput && referrerIdInput !== referrerId) {
-          await db.exec("ROLLBACK");
-          return sendError(res, 400, "referrer_mismatch");
-        }
-        await db.run(
-          `UPDATE refcodes
-           SET used_by_steamid64 = ?, used_utc = ?
-           WHERE code = ?`,
-          referredId,
-          nowIso,
-          code
-        );
-      }
-
-      if (!isValidSteamId64(referrerId)) {
+      if (refcodeRow.expires_utc <= nowIso) {
         await db.exec("ROLLBACK");
-        return sendError(res, 400, "invalid_referrer_id");
+        return sendError(res, 400, "expired_code");
       }
-      if (referrerId === referredId) {
+      if (refcodeRow.used_by_steamid64) {
         await db.exec("ROLLBACK");
-        return sendError(res, 400, "self_referral_not_allowed");
+        return sendError(res, 400, "invalid_code");
       }
 
       await db.run(
-        `INSERT INTO referrals
-          (referrer_steamid64, referred_steamid64, status, created_utc)
-         VALUES (?, ?, ?, ?)`,
-        referrerId,
-        referredId,
-        "pending",
-        nowIso
+        `UPDATE refcodes
+         SET used_by_steamid64 = ?, used_utc = ?
+         WHERE code = ?`,
+        refcodeRow.owner_steamid64,
+        nowIso,
+        code
       );
 
+      const token = createSessionToken(refcodeRow.owner_steamid64);
       await db.exec("COMMIT");
-      return res.status(200).json({ ok: true, status: "pending" });
+      return res.status(200).json({
+        token,
+        expiresIn: SESSION_TTL_SECONDS_VALUE,
+        steamid64: refcodeRow.owner_steamid64
+      });
     } catch (err) {
       await db.exec("ROLLBACK");
-      if (String(err?.message || "").toLowerCase().includes("constraint")) {
-        return sendError(res, 409, "Referral already exists");
-      }
       throw err;
     }
   } catch (err) {
-    console.warn("Referral create error:", err?.message || err);
+    console.warn("Refcode consume error:", err?.message || err);
+    return sendError(res, 503, "service_unavailable");
+  }
+});
+
+app.get("/api/referrals/me", async (req, res) => {
+  try {
+    const token = getReferralAuthToken(req);
+    const payload = verifyJwt(token);
+    const steamid64 = String(payload?.steamid64 || payload?.sub || "").trim();
+    if (!isValidSteamId64(steamid64)) {
+      return sendError(res, 401, "unauthorized");
+    }
+
+    const db = await dbPromise;
+    const referralRows = await db.all(
+      `SELECT referred_steamid64, status, created_utc, confirmed_utc, verified_utc
+       FROM referrals
+       WHERE referrer_steamid64 = ?
+       ORDER BY created_utc DESC`,
+      steamid64
+    );
+    const countRow = await db.get(
+      "SELECT COUNT(*) AS count FROM referrals WHERE referrer_steamid64 = ? AND status = 'verified'",
+      steamid64
+    );
+    const verifiedCount = Number(countRow?.count || 0);
+
+    return res.status(200).json({
+      verifiedCount,
+      requiredCount: REFERRAL_REQUIRED_VERIFIED,
+      eligible: verifiedCount >= REFERRAL_REQUIRED_VERIFIED,
+      referrals: referralRows.map((row) => ({
+        referredId: row.referred_steamid64,
+        displayName: null,
+        status: row.status,
+        createdAt: row.created_utc,
+        confirmedAt: row.confirmed_utc,
+        verifiedAt: row.verified_utc
+      }))
+    });
+  } catch (err) {
+    console.warn("Referral me error:", err?.message || err);
     return sendError(res, 500, "server_error");
   }
 });
 
-app.post("/api/referrals/confirm", async (req, res) => {
+app.post("/api/referrals/confirm", requireReferralAuth, async (req, res) => {
   try {
     const body = coerceBody(req);
     const referredId = String(body?.referredId || "").trim();
@@ -1182,7 +1309,7 @@ app.post("/api/referrals/confirm", async (req, res) => {
   }
 });
 
-app.post("/api/referrals/verify", async (req, res) => {
+app.post("/api/referrals/verify", requireReferralAuth, async (req, res) => {
   try {
     const body = coerceBody(req);
     const referredId = String(body?.referredId || "").trim();
@@ -1259,7 +1386,7 @@ app.post("/api/referrals/verify", async (req, res) => {
   }
 });
 
-app.get("/api/referrals/status", async (req, res) => {
+app.get("/api/referrals/status", requireReferralAuth, async (req, res) => {
   try {
     const steamid64 = String(req.query?.steamid64 || "").trim();
     if (!isValidSteamId64(steamid64)) {
@@ -1281,13 +1408,14 @@ app.get("/api/referrals/status", async (req, res) => {
     const verifiedCount = Number(countRow?.count || 0);
 
     return res.status(200).json({
-      ok: true,
       verifiedCount,
+      requiredCount: REFERRAL_REQUIRED_VERIFIED,
       eligible: verifiedCount >= REFERRAL_REQUIRED_VERIFIED,
       referrals: referralRows.map((row) => ({
         referredId: row.referred_steamid64,
         displayName: null,
         status: row.status,
+        createdAt: row.created_utc,
         confirmedAt: row.confirmed_utc,
         verifiedAt: row.verified_utc
       }))
