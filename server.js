@@ -212,6 +212,19 @@ async function initDb() {
     "CREATE INDEX IF NOT EXISTS referrals_referrer ON referrals (referrerId, status);"
   );
 
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS portal_codes (
+      code TEXT PRIMARY KEY,
+      steamid64 TEXT NOT NULL,
+      expiresAt TEXT NOT NULL,
+      createdAt TEXT NOT NULL
+    );
+  `);
+
+  await db.exec(
+    "CREATE INDEX IF NOT EXISTS portal_codes_expiry ON portal_codes (expiresAt);"
+  );
+
   return db;
 }
 
@@ -501,6 +514,14 @@ const REFERRAL_CODE_LENGTH = 6;
 const REFERRAL_CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const REFERRAL_REQUIRED_VERIFIED = 5;
 const REFERRAL_VERIFY_THRESHOLD_SECONDS = 86400;
+const PORTAL_CODE_LENGTH = 4;
+const PORTAL_CODE_TTL_MS = 10 * 60 * 1000;
+const PORTAL_CODE_MAX_ATTEMPTS = 6;
+const PORTAL_STATUS_RATE_LIMIT = {
+  limit: 10,
+  windowMs: 60 * 1000
+};
+const portalStatusRateCache = new Map();
 
 function isValidSteamId64(value) {
   return /^\d{17}$/.test(String(value || "").trim());
@@ -519,6 +540,43 @@ function generateReferralCode() {
   return code;
 }
 
+function generatePortalCode() {
+  const value = crypto.randomInt(0, 10 ** PORTAL_CODE_LENGTH);
+  return String(value).padStart(PORTAL_CODE_LENGTH, "0");
+}
+
+function normalizePortalCode(value) {
+  return String(value || "").trim();
+}
+
+function isValidPortalCode(value) {
+  return /^\d{4}$/.test(String(value || ""));
+}
+
+function getRequestIp(req) {
+  const header = req.headers["x-forwarded-for"];
+  if (header) {
+    const parts = String(header).split(",").map((part) => part.trim()).filter(Boolean);
+    if (parts.length > 0) return parts[0];
+  }
+  return req.ip || req.connection?.remoteAddress || "unknown";
+}
+
+function isPortalStatusRateLimited(req, now = Date.now()) {
+  const ip = getRequestIp(req);
+  const record = portalStatusRateCache.get(ip);
+  if (!record || now >= record.resetAt) {
+    portalStatusRateCache.set(ip, { count: 1, resetAt: now + PORTAL_STATUS_RATE_LIMIT.windowMs });
+    return false;
+  }
+  if (record.count >= PORTAL_STATUS_RATE_LIMIT.limit) {
+    return true;
+  }
+  record.count += 1;
+  portalStatusRateCache.set(ip, record);
+  return false;
+}
+
 function getReferralAuthToken(req) {
   const header = req.headers.authorization || "";
   if (!header.startsWith("Bearer ")) return "";
@@ -528,6 +586,32 @@ function getReferralAuthToken(req) {
 function isReferralAuthorized(req) {
   const token = getReferralAuthToken(req);
   return token && token === REFERRAL_SERVER_SECRET;
+}
+
+async function cleanupExpiredPortalCodes(db, nowIso = new Date().toISOString()) {
+  await db.run("DELETE FROM portal_codes WHERE expiresAt <= ?", nowIso);
+}
+
+async function consumePortalCode(db, code) {
+  const nowIso = new Date().toISOString();
+  await db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = await db.get(
+      "SELECT code, steamid64, expiresAt FROM portal_codes WHERE code = ? AND expiresAt > ?",
+      code,
+      nowIso
+    );
+    if (!row) {
+      await db.exec("ROLLBACK");
+      return null;
+    }
+    await db.run("DELETE FROM portal_codes WHERE code = ?", code);
+    await db.exec("COMMIT");
+    return row;
+  } catch (err) {
+    await db.exec("ROLLBACK");
+    throw err;
+  }
 }
 const STATUS_CACHE_TTL_MS = 10 * 1000;
 const STATUS_RAW_MAX = 600;
@@ -939,6 +1023,124 @@ app.get("/server/status", async (req, res) => {
     });
     writeStatusCache(payload);
     return res.status(200).json(payload);
+  }
+});
+app.post("/api/referrals/portal-code", async (req, res) => {
+  if (!isReferralAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+
+  try {
+    const body = coerceBody(req);
+    const steamid64 = String(body?.steamid64 || "").trim();
+    if (!isValidSteamId64(steamid64)) {
+      return res.status(400).json({ ok: false, error: "invalid_steamid64" });
+    }
+
+    const db = await dbPromise;
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    await cleanupExpiredPortalCodes(db, nowIso);
+
+    let code = "";
+    for (let attempt = 0; attempt < PORTAL_CODE_MAX_ATTEMPTS; attempt += 1) {
+      const candidate = generatePortalCode();
+      const existing = await db.get(
+        "SELECT code FROM portal_codes WHERE code = ? AND expiresAt > ?",
+        candidate,
+        nowIso
+      );
+      if (existing) {
+        continue;
+      }
+      const expiresAtIso = new Date(now + PORTAL_CODE_TTL_MS).toISOString();
+      try {
+        await db.run(
+          "INSERT INTO portal_codes (code, steamid64, expiresAt, createdAt) VALUES (?, ?, ?, ?)",
+          candidate,
+          steamid64,
+          expiresAtIso,
+          nowIso
+        );
+        code = candidate;
+        break;
+      } catch (err) {
+        if (String(err?.message || "").toLowerCase().includes("constraint")) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!code) {
+      return res.status(503).json({ ok: false, error: "code_generation_failed" });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      code,
+      expiresInSeconds: Math.floor(PORTAL_CODE_TTL_MS / 1000)
+    });
+  } catch (err) {
+    console.warn("Portal code error:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+app.get("/api/referrals/portal-status", async (req, res) => {
+  if (isPortalStatusRateLimited(req)) {
+    return res.status(429).json({ ok: false, error: "invalid_or_expired_code" });
+  }
+
+  try {
+    const code = normalizePortalCode(req.query?.code);
+    if (!isValidPortalCode(code)) {
+      return res.status(401).json({ ok: false, error: "invalid_or_expired_code" });
+    }
+
+    const db = await dbPromise;
+    await cleanupExpiredPortalCodes(db);
+    const portalRow = await consumePortalCode(db, code);
+    if (!portalRow) {
+      return res.status(401).json({ ok: false, error: "invalid_or_expired_code" });
+    }
+
+    const steamid64 = portalRow.steamid64;
+    const referralRows = await db.all(
+      `SELECT referrerId, referredId, status, confirmedAt, verifiedAt
+       FROM referrals WHERE referrerId = ?
+       ORDER BY createdAt DESC`,
+      steamid64
+    );
+    const countRow = await db.get(
+      "SELECT COUNT(*) AS count FROM referrals WHERE referrerId = ? AND status = 'verified'",
+      steamid64
+    );
+    const verifiedCount = Number(countRow?.count || 0);
+    const meta = await db.get(
+      "SELECT eligibleAt FROM referrer_meta WHERE referrerId = ?",
+      steamid64
+    );
+
+    return res.status(200).json({
+      ok: true,
+      steamid64,
+      verifiedCount,
+      required: REFERRAL_REQUIRED_VERIFIED,
+      eligible: Boolean(meta?.eligibleAt),
+      referrals: referralRows.map((row) => ({
+        referredId: row.referredId,
+        status: row.status,
+        confirmedAt: row.confirmedAt,
+        verifiedAt: row.verifiedAt
+      })),
+      playSeconds: null,
+      afkSeconds: null,
+      totalSeconds: null,
+      remainingSeconds: null
+    });
+  } catch (err) {
+    console.warn("Portal status error:", err?.message || err);
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 app.post("/api/referrals/request", async (req, res) => {
@@ -1581,4 +1783,12 @@ setInterval(() => {
   processExpiredEntitlements().catch((err) => {
     console.error("Failed to process expired entitlements:", err);
   });
+  processExpiredPortalCodes().catch((err) => {
+    console.error("Failed to process expired portal codes:", err);
+  });
 }, 60 * 1000);
+
+async function processExpiredPortalCodes() {
+  const db = await dbPromise;
+  await cleanupExpiredPortalCodes(db);
+}
