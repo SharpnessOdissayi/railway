@@ -51,6 +51,7 @@ const {
   DRY_RUN = "false",
   TRAZNILA_NOTIFY_SECRET,
   BESTSERVERS_SERVERKEY,
+  REFERRAL_API_TOKEN,
   REFERRAL_SERVER_SECRET,
   REFERRAL_SESSION_SECRET,
   REFCODE_TTL_SECONDS,
@@ -66,10 +67,18 @@ function required(name, value) {
 
 required("API_SECRET", API_SECRET);
 required("BESTSERVERS_SERVERKEY", BESTSERVERS_SERVERKEY);
-required("REFERRAL_SERVER_SECRET", REFERRAL_SERVER_SECRET);
+const referralAuthConfig = resolveReferralAuthConfig({
+  REFERRAL_API_TOKEN,
+  REFERRAL_SERVER_SECRET
+});
+if (!referralAuthConfig.token) {
+  console.warn(
+    "Referral auth token is not configured (REFERRAL_API_TOKEN or REFERRAL_SERVER_SECRET missing)."
+  );
+}
 const referralSessionSecret =
-  REFERRAL_SESSION_SECRET || process.env.REFCODE_SESSION_SECRET || "";
-required("REFERRAL_SESSION_SECRET", referralSessionSecret);
+  process.env.REFCODE_SESSION_SECRET || REFERRAL_SESSION_SECRET || "";
+const refcodeSigningSecret = referralSessionSecret || API_SECRET;
 const isDryRun = DRY_RUN.toLowerCase() === "true";
 const isRconConfigured = !!(RCON_HOST && RCON_PORT && RCON_PASSWORD);
 const DISCORD_WEBHOOK_KEYS = [
@@ -90,7 +99,7 @@ if (!hasDiscordWebhook) {
     "Discord webhook is not configured (DISCORD_WEBHOOK_URL, DISCORD_WEBHOOK, or WEBHOOK_URL missing). Notifications will be skipped."
   );
 }
-const referralServerSecret = REFERRAL_SERVER_SECRET;
+const referralServerSecret = referralAuthConfig.token;
 
 const DATABASE_PATH = DB_PATH || "./data.sqlite";
 const PROCESSED_TTL_MS = 24 * 60 * 60 * 1000;
@@ -293,6 +302,25 @@ function resolveDiscordWebhook(env, keys) {
     }
   }
   return { url: "", keyName: "" };
+}
+
+function resolveReferralAuthConfig(env) {
+  if (env.REFERRAL_API_TOKEN && String(env.REFERRAL_API_TOKEN).trim() !== "") {
+    return {
+      token: String(env.REFERRAL_API_TOKEN).trim(),
+      keyName: "REFERRAL_API_TOKEN"
+    };
+  }
+  if (
+    env.REFERRAL_SERVER_SECRET &&
+    String(env.REFERRAL_SERVER_SECRET).trim() !== ""
+  ) {
+    return {
+      token: String(env.REFERRAL_SERVER_SECRET).trim(),
+      keyName: "REFERRAL_SERVER_SECRET"
+    };
+  }
+  return { token: "", keyName: "none" };
 }
 
 function logDiscordWebhookConfigured() {
@@ -572,9 +600,28 @@ function isValidRefcode(value) {
   return /^\d{4}$/.test(String(value || ""));
 }
 
+function extractReferralIds(body) {
+  const sources = [body || {}];
+  const referrerId = pickFirstFromSources(sources, [
+    "referrerId",
+    "referrerSteamId",
+    "referrerSteamid64",
+    "referrer_steamid64",
+    "referrer"
+  ]);
+  const referredId = pickFirstFromSources(sources, [
+    "referredId",
+    "referredSteamId",
+    "referredSteamid64",
+    "referred_steamid64",
+    "referred"
+  ]);
+  return { referrerId, referredId };
+}
+
 function signRefcode(code) {
   return crypto
-    .createHmac("sha256", referralSessionSecret)
+    .createHmac("sha256", refcodeSigningSecret)
     .update(code)
     .digest("hex");
 }
@@ -587,26 +634,26 @@ function base64UrlEncodeJson(payload) {
   return base64UrlEncode(JSON.stringify(payload));
 }
 
-function signJwt(payload) {
+function signJwt(payload, secret) {
   const header = { alg: "HS256", typ: "JWT" };
   const headerEncoded = base64UrlEncodeJson(header);
   const payloadEncoded = base64UrlEncodeJson(payload);
   const data = `${headerEncoded}.${payloadEncoded}`;
   const signature = crypto
-    .createHmac("sha256", referralSessionSecret)
+    .createHmac("sha256", secret)
     .update(data)
     .digest("base64url");
   return `${data}.${signature}`;
 }
 
-function verifyJwt(token) {
-  if (!token) return null;
+function verifyJwt(token, secret) {
+  if (!token || !secret) return null;
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   const [headerEncoded, payloadEncoded, signature] = parts;
   const data = `${headerEncoded}.${payloadEncoded}`;
   const expected = crypto
-    .createHmac("sha256", referralSessionSecret)
+    .createHmac("sha256", secret)
     .update(data)
     .digest("base64url");
   try {
@@ -628,13 +675,54 @@ function verifyJwt(token) {
 }
 
 function createSessionToken(steamid64) {
+  if (!referralSessionSecret) {
+    return createOpaqueSessionToken(steamid64);
+  }
   const nowSeconds = Math.floor(Date.now() / 1000);
-  return signJwt({
-    sub: steamid64,
-    steamid64,
-    iat: nowSeconds,
-    exp: nowSeconds + SESSION_TTL_SECONDS_VALUE
-  });
+  return signJwt(
+    {
+      sub: steamid64,
+      steamid64,
+      iat: nowSeconds,
+      exp: nowSeconds + SESSION_TTL_SECONDS_VALUE
+    },
+    referralSessionSecret
+  );
+}
+
+const sessionStore = new Map();
+
+function createOpaqueSessionToken(steamid64) {
+  const token = crypto.randomBytes(32).toString("base64url");
+  const expiresAt = Date.now() + SESSION_TTL_SECONDS_VALUE * 1000;
+  sessionStore.set(token, { steamid64, expiresAt });
+  return token;
+}
+
+function cleanupSessionStore(now = Date.now()) {
+  for (const [token, session] of sessionStore.entries()) {
+    if (session.expiresAt <= now) {
+      sessionStore.delete(token);
+    }
+  }
+}
+
+function verifySessionToken(token) {
+  if (!token) return null;
+  if (referralSessionSecret) {
+    const payload = verifyJwt(token, referralSessionSecret);
+    if (!payload) return null;
+    const steamid64 = String(payload?.steamid64 || payload?.sub || "").trim();
+    return { steamid64 };
+  }
+  cleanupSessionStore();
+  const session = sessionStore.get(token);
+  if (!session) return null;
+  if (session.expiresAt <= Date.now()) {
+    sessionStore.delete(token);
+    return null;
+  }
+  return { steamid64: session.steamid64 };
 }
 
 function getClientIp(req) {
@@ -667,11 +755,6 @@ function getReferralAuthToken(req) {
   return header.slice("Bearer ".length).trim();
 }
 
-function isReferralAuthorized(req) {
-  const token = getReferralAuthToken(req);
-  return Boolean(token && referralServerSecret && token === referralServerSecret);
-}
-
 async function cleanupExpiredRefcodes(db, nowIso = new Date().toISOString()) {
   await db.run("DELETE FROM refcodes WHERE expires_utc <= ?", nowIso);
 }
@@ -681,7 +764,12 @@ function sendError(res, status, message) {
 }
 
 function requireReferralAuth(req, res, next) {
-  if (!isReferralAuthorized(req)) {
+  const token = getReferralAuthToken(req);
+  const authPresent = Boolean(token);
+  if (!token || !referralServerSecret || token !== referralServerSecret) {
+    console.warn(
+      `Referral auth failed: auth_present=${authPresent} env=${referralAuthConfig.keyName}`
+    );
     return sendError(res, 401, "unauthorized");
   }
   return next();
@@ -1179,8 +1267,8 @@ app.post("/api/refcode/consume", async (req, res) => {
 app.get("/api/referrals/me", async (req, res) => {
   try {
     const token = getReferralAuthToken(req);
-    const payload = verifyJwt(token);
-    const steamid64 = String(payload?.steamid64 || payload?.sub || "").trim();
+    const session = verifySessionToken(token);
+    const steamid64 = String(session?.steamid64 || "").trim();
     if (!isValidSteamId64(steamid64)) {
       return sendError(res, 401, "unauthorized");
     }
@@ -1217,6 +1305,53 @@ app.get("/api/referrals/me", async (req, res) => {
     return sendError(res, 500, "server_error");
   }
 });
+
+async function handleReferralRequest(req, res) {
+  try {
+    const body = coerceBody(req);
+    const { referrerId, referredId } = extractReferralIds(body);
+    if (!isValidSteamId64(referrerId)) {
+      return sendError(res, 400, "invalid_referrer_id");
+    }
+    if (!isValidSteamId64(referredId)) {
+      return sendError(res, 400, "invalid_referred_id");
+    }
+    if (referrerId === referredId) {
+      return sendError(res, 409, "self_referral");
+    }
+
+    const db = await dbPromise;
+    const nowIso = new Date().toISOString();
+
+    const existing = await db.get(
+      `SELECT id FROM referrals WHERE referred_steamid64 = ? LIMIT 1`,
+      referredId
+    );
+    if (existing) {
+      return res.status(409).json({ ok: false, message: "referral_exists" });
+    }
+
+    await db.run(
+      `INSERT INTO referrals (referrer_steamid64, referred_steamid64, status, created_utc)
+       VALUES (?, ?, ?, ?)`,
+      referrerId,
+      referredId,
+      "pending",
+      nowIso
+    );
+
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    if (String(err?.message || "").toLowerCase().includes("constraint")) {
+      return res.status(409).json({ ok: false, message: "referral_exists" });
+    }
+    console.warn("Referral request error:", err?.message || err);
+    return sendError(res, 500, "server_error");
+  }
+}
+
+app.post("/api/referrals/request", requireReferralAuth, handleReferralRequest);
+app.post("/api/referrals", requireReferralAuth, handleReferralRequest);
 
 app.post("/api/referrals/confirm", requireReferralAuth, async (req, res) => {
   try {
